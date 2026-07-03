@@ -16,7 +16,9 @@ nhiều mô hình** cạnh nhau. (Đồ án DSP391m — FPTU Summer 2026.)
 
 ## Sáu engine để so sánh
 
-Site so sánh trực tiếp **6 mô hình** trên cùng đầu vào, tối đa 4 mô hình mỗi lần
+Site so sánh trực tiếp **cả 6 mô hình cùng lúc** trên cùng đầu vào — kết quả của
+từng mô hình **hiện ngay khi tạo xong** (engine nhanh chạy trước, không phải chờ
+toàn bộ)
 (`engines.py` chứa 5 engine bổ sung, nạp lười — lần đầu chọn sẽ tải mô hình).
 Giao diện **song ngữ Việt/Anh** (nút chuyển ở góc trên bên phải).
 

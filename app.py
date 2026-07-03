@@ -338,7 +338,11 @@ def _infer_one(model_key, ref_audio_path, ref_text, gen_text, speed, nfe, seed=N
     return _postprocess(wave), sr
 
 
-MAX_SLOTS = 4   # số mô hình tối đa so sánh cùng lúc
+MAX_SLOTS = 6   # đủ chỗ so sánh CẢ 6 engine cùng lúc
+
+# Engine nhanh chạy TRƯỚC để kết quả xuất hiện sớm nhất có thể
+# (piper ~2s, mms ~4s, edge ~5s, xtts ~30s, f5 ~60s, bark ~100s+ trên CPU).
+_ENGINE_COST = {"piper": 0, "mms": 1, "edge": 2, "xtts": 3, "f5tts": 4, "bark": 5}
 
 
 def _model_label(key: str, lang: str) -> str:
@@ -348,11 +352,14 @@ def _model_label(key: str, lang: str) -> str:
 
 def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
                lang="vi", progress=gr.Progress()):
-    """Sinh audio cho mọi mô hình được chọn; trả về dữ liệu cho từng slot UI."""
+    """Generator: sinh audio cho từng mô hình và CẬP NHẬT UI NGAY khi mỗi mô hình
+    xong (không bắt người dùng chờ toàn bộ). Engine nhanh được chạy trước.
+    """
     L = I18N.get(lang) or I18N["vi"]
     if not model_keys:
         raise gr.Error(L["err_no_model"])
     keys = list(model_keys)[:MAX_SLOTS]
+    keys.sort(key=lambda k: _ENGINE_COST.get(MODEL_REGISTRY[k].get("engine", "f5tts"), 9))
     engines_sel = {MODEL_REGISTRY[k].get("engine", "f5tts") for k in keys}
     # Chỉ F5-TTS & XTTS nhân bản giọng nên mới cần audio mẫu.
     if not ref_audio_path and engines_sel & REF_REQUIRED_ENGINES:
@@ -373,6 +380,29 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
     # Chuẩn hoá văn bản cần đọc; transcript mẫu chỉ chuẩn hoá nhẹ (không thêm dấu cuối).
     gen_text_n = _normalize_vi(gen_text, add_end_punct=True)
 
+    # Trạng thái từng slot + cơ chế "dirty": mỗi lần yield CHỈ gửi giá trị cho slot
+    # vừa thay đổi (gr.update() rỗng cho slot khác) → không reset audio đang phát.
+    slot_md = [""] * MAX_SLOTS
+    slot_audio = [None] * MAX_SLOTS
+    dirty = set(range(MAX_SLOTS))
+
+    def render(note):
+        updates = [note]
+        for i in range(MAX_SLOTS):
+            if i in dirty:
+                updates += [gr.update(visible=i < len(keys)),
+                            gr.update(value=slot_md[i]),
+                            gr.update(value=slot_audio[i])]
+            else:
+                updates += [gr.update(), gr.update(), gr.update()]
+        dirty.clear()
+        return updates
+
+    # Hiện ngay toàn bộ slot ở trạng thái "trong hàng đợi".
+    for i, key in enumerate(keys):
+        slot_md[i] = f"**{_model_label(key, lang)}**\n\n{L['queued']}"
+    yield render(L["preparing"])
+
     # Chỉ F5-TTS cần transcript của audio mẫu (XTTS nhân bản trực tiếp từ audio,
     # các engine còn lại dùng giọng cố định). Chỉ chạy Whisper khi có chọn F5-TTS.
     _ref_text = ref_text.strip() if ref_text and ref_text.strip() else ""
@@ -384,11 +414,16 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
                         if _ref_text else L["whisper_na"])
     _ref_text = _normalize_vi(_ref_text, add_end_punct=False)
 
-    results = []
+    seed_line = f"Seed: {seed}"
+    note_out = f"{whisper_note}\n{seed_line}".strip() if whisper_note else seed_line
+
     for i, key in enumerate(keys):
         label = _model_label(key, lang)
-        progress((i + 1) / (len(keys) + 1),
-                 desc=f"({i + 1}/{len(keys)}) {label.split('—')[0].strip()}")
+        short = label.split("—")[0].strip()
+        progress((i + 0.5) / len(keys), desc=f"({i + 1}/{len(keys)}) {short}")
+        slot_md[i] = f"**{label}**\n\n{L['generating']}"
+        dirty.add(i)
+        yield render(note_out)
         try:
             # Cùng seed cho mọi model → so sánh công bằng (cùng nhiễu khởi tạo).
             t0 = time.time()
@@ -397,28 +432,14 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
             gen_s = time.time() - t0
             sf.write(str(OUTPUT_DIR / f"{key}.wav"), wave, sr)
             note = _quality_note(wave, sr, lang)
-            results.append(((sr, wave),
-                            f"**{label}**\n\n{note}  ·  {L['gen_time'].format(s=gen_s)}"))
+            slot_md[i] = f"**{label}**\n\n{note}  ·  {L['gen_time'].format(s=gen_s)}"
+            slot_audio[i] = (sr, wave)
         except Exception as e:
             traceback.print_exc()
-            results.append((None, f"**{label}**\n\n{L['slot_err'].format(e=e)}"))
-
-    seed_line = f"Seed: {seed}"
-    note_out = f"{whisper_note}\n{seed_line}".strip() if whisper_note else seed_line
-
-    # Mỗi slot: (cột chứa card, markdown thông tin, audio) — ẩn cột khi không dùng.
-    updates = []
-    for i in range(MAX_SLOTS):
-        if i < len(results):
-            audio, md = results[i]
-            updates += [gr.update(visible=True),
-                        gr.update(value=md),
-                        gr.update(value=audio)]
-        else:
-            updates += [gr.update(visible=False),
-                        gr.update(value=""),
-                        gr.update(value=None)]
-    return [note_out] + updates
+            slot_md[i] = f"**{label}**\n\n{L['slot_err'].format(e=e)}"
+            slot_audio[i] = None
+        dirty.add(i)
+        yield render(note_out)
 
 
 # ─── Song ngữ (i18n) ─────────────────────────────────────────────────────────────
@@ -473,6 +494,9 @@ I18N = {
         whisper_na="[Whisper không khả dụng — vẫn thử suy luận]",
         gen_time="tạo mất {s:.1f} giây",
         slot_err="Lỗi: {e}",
+        preparing="Đang chuẩn bị...",
+        queued="Trong hàng đợi — engine nhanh sẽ chạy trước...",
+        generating="Đang tạo giọng nói...",
     ),
     "en": dict(
         hero_sub=("Compare Vietnamese text-to-speech models head-to-head — listen to results "
@@ -523,6 +547,9 @@ I18N = {
         whisper_na="[Whisper unavailable — proceeding anyway]",
         gen_time="generated in {s:.1f} s",
         slot_err="Error: {e}",
+        preparing="Preparing...",
+        queued="Queued — faster engines run first...",
+        generating="Generating speech...",
     ),
 }
 
@@ -541,7 +568,13 @@ CSS = """
   border-radius: 999px; background: rgba(255,255,255,.16); font-size: .78rem;
   letter-spacing: .3px;}
 #lang-row {display: flex; justify-content: flex-end !important; margin: 2px 0 0;}
-#lang-toggle {min-width: 0 !important; flex-grow: 0 !important; margin-left: auto !important;}
+#lang-toggle {width: 300px !important; min-width: 300px !important;
+  flex: 0 0 300px !important; margin-left: auto !important;
+  border: 2px solid #2e75b6 !important; border-radius: 12px !important;
+  padding: 8px 16px !important; background: var(--background-fill-primary) !important;
+  box-shadow: 0 2px 10px rgba(46, 117, 182, .18) !important;}
+#lang-toggle .wrap {gap: 10px !important; flex-direction: row !important;}
+#lang-toggle label {font-weight: 600 !important; white-space: nowrap !important;}
 .panel {border: 1px solid var(--border-color-primary) !important;
   border-radius: 16px !important; padding: 16px !important;
   background: var(--background-fill-primary) !important;
@@ -581,7 +614,7 @@ def create_ui():
         with gr.Row(elem_id="lang-row"):
             lang = gr.Radio(
                 choices=[("Tiếng Việt", "vi"), ("English", "en")], value="vi",
-                show_label=False, container=False, elem_id="lang-toggle",
+                label="Ngôn ngữ · Language", elem_id="lang-toggle",
             )
         hero = gr.HTML(_hero_html("vi"))
 

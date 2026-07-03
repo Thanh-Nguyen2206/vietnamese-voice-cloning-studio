@@ -1,0 +1,37 @@
+# ─── Model weights & training artifacts (NẶNG — không push lên GitHub) ─────────
+# checkpoints/ chứa 2 file fine-tune trên dữ liệu giả (sóng sin), đã xác nhận
+# tạo ra nhiễu, không có giá trị dùng lại. optimizer_states/ chỉ cần cho việc
+# tiếp tục huấn luyện, không cần cho suy luận (inference).
+checkpoints/
+optimizer_states/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# ─── Cache mô hình tải về (HuggingFace, Whisper, Piper...) ─────────────────────
+.cache/
+**/hf_cache/
+
+# ─── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+venv/
+.venv/
+env/
+
+# ─── Output runtime (audio sinh ra khi chạy app, không cần versioning) ─────────
+outputs/
+
+# ─── macOS / IDE ────────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+
+# ─── Log & file tạm ─────────────────────────────────────────────────────────────
+logs/*.log
+*.tmp
+.claude/launch.json

@@ -52,6 +52,21 @@ Bản hiện tại dùng **đúng pipeline suy luận chính thức** và **mặ
 (cho ra giọng người sạch). Các checkpoint cũ vẫn được giữ và liệt kê trong giao diện
 so sánh để bạn tự nghe thấy chúng kém hơn.
 
+## File lớn không có trong repo GitHub
+
+Repo này **không chứa model weights** (`checkpoints/`, `optimizer_states/` — tổng ~7.5GB).
+Lý do: hai checkpoint fine-tune đó được huấn luyện trên dữ liệu **giả** (sóng sin, xem
+`data/_invalid_demo_data/README.md`) nên chỉ tạo ra nhiễu, không có giá trị dùng lại —
+và `optimizer_states/` chỉ cần cho việc *tiếp tục* huấn luyện, không cần để chạy app.
+
+Bạn **không cần tải gì thêm** để chạy app: mô hình gốc (`hynt/F5-TTS-Vietnamese-ViVoice`)
+và tất cả engine khác đều **tự động tải từ HuggingFace Hub** trong lần chạy đầu tiên
+(`python app.py`), và được cache lại cho các lần sau.
+
+Nếu bạn tự fine-tune (mục *Fine-tune trên giọng của bạn* bên dưới) trên **dữ liệu giọng
+người thật**, checkpoint mới sẽ lưu vào `checkpoints/` — thư mục này đã có trong
+`.gitignore` nên sẽ không vô tình bị commit lên GitHub.
+
 ## Cài đặt
 
 ```bash
@@ -90,7 +105,7 @@ VVCS_DEVICE=cuda python app.py     # hoặc VVCS_DEVICE=mps (thử nghiệm)
 python scripts/compare_models.py --ref reference_audio/audio.wav
 # chỉ định mô hình & câu:
 python scripts/compare_models.py --ref ref.wav \
-    --models base ft_step_0001000 --nfe 32
+    --models base xtts piper --nfe 32
 ```
 
 Kết quả: `outputs/comparison/*.wav` + `outputs/comparison/report.md`.

@@ -346,10 +346,6 @@ def _infer_one(model_key, ref_audio_path, ref_text, gen_text, speed, nfe, seed=N
 
 MAX_SLOTS = 6   # đủ chỗ so sánh CẢ 6 engine cùng lúc
 
-# Engine nhanh chạy TRƯỚC để kết quả xuất hiện sớm nhất có thể
-# (piper ~2s, mms ~4s, edge ~5s, xtts ~30s, f5 ~60s, bark ~100s+ trên CPU).
-_ENGINE_COST = {"piper": 0, "mms": 1, "edge": 2, "xtts": 3, "f5tts": 4, "bark": 5}
-
 
 def _model_label(key: str, lang: str) -> str:
     entry = MODEL_REGISTRY[key]
@@ -409,8 +405,11 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
     L = I18N.get(lang) or I18N["vi"]
     if not model_keys:
         raise gr.Error(L["err_no_model"])
-    keys = list(model_keys)[:MAX_SLOTS]
-    keys.sort(key=lambda k: _ENGINE_COST.get(MODEL_REGISTRY[k].get("engine", "f5tts"), 9))
+    # Giữ đúng thứ tự hiển thị trong danh sách chọn mô hình (thứ tự MODEL_REGISTRY),
+    # để card kết quả xếp cùng thứ tự với các ô checkbox bên trái — không xáo theo
+    # tốc độ engine nữa (người dùng phản hồi thứ tự "nhanh trước" gây khó theo dõi).
+    _registry_order = {k: i for i, k in enumerate(MODEL_REGISTRY)}
+    keys = sorted(set(model_keys), key=lambda k: _registry_order.get(k, 9))[:MAX_SLOTS]
     engines_sel = {MODEL_REGISTRY[k].get("engine", "f5tts") for k in keys}
     # Chỉ F5-TTS & XTTS nhân bản giọng nên mới cần audio mẫu.
     if not ref_audio_path and engines_sel & REF_REQUIRED_ENGINES:

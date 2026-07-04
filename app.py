@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import html as html_mod
 import random
 import argparse
 import threading
@@ -271,17 +272,22 @@ _VERDICTS = {
 }
 
 
-def _quality_note(wave: np.ndarray, sr: int, lang: str = "vi") -> str:
+def _quality_parts(wave: np.ndarray, sr: int, lang: str = "vi"):
+    """Trả về (verdict, ok?, rms, flat, dur) — dùng cho cả text lẫn thẻ HTML."""
     v = _VERDICTS.get(lang, _VERDICTS["vi"])
     rms = float(np.sqrt(np.mean(wave ** 2))) if wave.size else 0.0
     flat = _spectral_flatness(wave)
     dur = len(wave) / sr if sr else 0.0
     if rms < 0.02:
-        verdict = v["silent"]
-    elif flat > 0.30:
-        verdict = v["noisy"]
-    else:
-        verdict = v["ok"]
+        return v["silent"], False, rms, flat, dur
+    if flat > 0.30:
+        return v["noisy"], False, rms, flat, dur
+    return v["ok"], True, rms, flat, dur
+
+
+def _quality_note(wave: np.ndarray, sr: int, lang: str = "vi") -> str:
+    verdict, _ok, rms, flat, dur = _quality_parts(wave, sr, lang)
+    v = _VERDICTS.get(lang, _VERDICTS["vi"])
     return f"**{verdict}**  ·  RMS={rms:.3f}  ·  {v['flat']}={flat:.3f}  ·  {dur:.1f}s"
 
 
@@ -350,10 +356,55 @@ def _model_label(key: str, lang: str) -> str:
     return entry["label"] if lang == "vi" else entry.get("label_en", entry["label"])
 
 
+def _slot_html(label, state, lang, metrics=None, gen_s=None, err=""):
+    """Thẻ trạng thái HTML cho từng slot: queued / generating / done / error."""
+    L = I18N.get(lang) or I18N["vi"]
+    v = _VERDICTS.get(lang, _VERDICTS["vi"])
+    title = f'<div class="slot-title">{html_mod.escape(label)}</div>'
+    if state == "queued":
+        pill = f'<span class="pill pill-queued">{L["queued_pill"]}</span>'
+        body = ""
+    elif state == "generating":
+        pill = (f'<span class="pill pill-gen"><span class="spinner"></span>'
+                f'{L["generating_pill"]}</span>')
+        body = '<div class="indet"><div></div></div>'
+    elif state == "done":
+        verdict, ok, rms, flat, dur = metrics
+        pill = (f'<span class="pill pill-done">{L["done_pill"]} · '
+                f'{L["gen_time"].format(s=gen_s)}</span>')
+        body = ('<div class="chips">'
+                f'<span class="chip {"chip-ok" if ok else "chip-warn"}">{html_mod.escape(verdict)}</span>'
+                f'<span class="chip">RMS {rms:.3f}</span>'
+                f'<span class="chip">{v["flat"]} {flat:.3f}</span>'
+                f'<span class="chip">{dur:.1f}s</span></div>')
+    else:  # error
+        pill = f'<span class="pill pill-err">{L["error_pill"]}</span>'
+        body = f'<div class="slot-err">{html_mod.escape(str(err)[:300])}</div>'
+    return f'<div class="slot-head">{title}{pill}</div>{body}'
+
+
+def _status_html(done, total, current_short, lang, total_s=None, extra=""):
+    """Thanh trạng thái tổng: tiến độ x/y + engine đang chạy (thay overlay Gradio)."""
+    L = I18N.get(lang) or I18N["vi"]
+    if total_s is not None:
+        left = (f'<span class="pill pill-done">'
+                f'{L["status_done"].format(n=total, s=total_s)}</span>')
+        bar = '<div class="bar"><div style="width:100%"></div></div>'
+    else:
+        left = (f'<span class="pill pill-gen"><span class="spinner"></span>'
+                f'{L["status_running"].format(i=done + 1, n=total, name=html_mod.escape(current_short))}</span>')
+        pct = int(100 * done / max(total, 1))
+        bar = f'<div class="bar"><div style="width:{pct}%"></div></div>'
+    note = f'<span class="status-note">{html_mod.escape(extra)}</span>' if extra else ""
+    return f'<div class="status"><div class="status-row">{left}{note}</div>{bar}</div>'
+
+
 def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
-               lang="vi", progress=gr.Progress()):
+               lang="vi"):
     """Generator: sinh audio cho từng mô hình và CẬP NHẬT UI NGAY khi mỗi mô hình
-    xong (không bắt người dùng chờ toàn bộ). Engine nhanh được chạy trước.
+    xong. Engine nhanh chạy trước. Trạng thái hiển thị bằng thẻ HTML riêng cho từng
+    card + thanh tiến độ tổng (event dùng show_progress='hidden' nên KHÔNG còn
+    lớp overlay của Gradio che kết quả trong lúc chạy).
     """
     L = I18N.get(lang) or I18N["vi"]
     if not model_keys:
@@ -380,18 +431,22 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
     # Chuẩn hoá văn bản cần đọc; transcript mẫu chỉ chuẩn hoá nhẹ (không thêm dấu cuối).
     gen_text_n = _normalize_vi(gen_text, add_end_punct=True)
 
+    labels = [_model_label(k, lang) for k in keys]
+    shorts = [lb.split("—")[0].strip() for lb in labels]
+    t_start = time.time()
+
     # Trạng thái từng slot + cơ chế "dirty": mỗi lần yield CHỈ gửi giá trị cho slot
     # vừa thay đổi (gr.update() rỗng cho slot khác) → không reset audio đang phát.
-    slot_md = [""] * MAX_SLOTS
+    slot_html = [""] * MAX_SLOTS
     slot_audio = [None] * MAX_SLOTS
     dirty = set(range(MAX_SLOTS))
 
-    def render(note):
-        updates = [note]
+    def render(status, note):
+        updates = [status, note]
         for i in range(MAX_SLOTS):
             if i in dirty:
                 updates += [gr.update(visible=i < len(keys)),
-                            gr.update(value=slot_md[i]),
+                            gr.update(value=slot_html[i]),
                             gr.update(value=slot_audio[i])]
             else:
                 updates += [gr.update(), gr.update(), gr.update()]
@@ -399,16 +454,17 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
         return updates
 
     # Hiện ngay toàn bộ slot ở trạng thái "trong hàng đợi".
-    for i, key in enumerate(keys):
-        slot_md[i] = f"**{_model_label(key, lang)}**\n\n{L['queued']}"
-    yield render(L["preparing"])
+    for i in range(len(keys)):
+        slot_html[i] = _slot_html(labels[i], "queued", lang)
+    yield render(_status_html(0, len(keys), shorts[0], lang), L["preparing"])
 
     # Chỉ F5-TTS cần transcript của audio mẫu (XTTS nhân bản trực tiếp từ audio,
     # các engine còn lại dùng giọng cố định). Chỉ chạy Whisper khi có chọn F5-TTS.
     _ref_text = ref_text.strip() if ref_text and ref_text.strip() else ""
     whisper_note = ""
     if "f5tts" in engines_sel and not _ref_text and ref_audio_path:
-        progress(0.05, desc=L["whisper_progress"])
+        yield render(_status_html(0, len(keys), shorts[0], lang,
+                                  extra=L["whisper_progress"]), L["preparing"])
         _ref_text = _transcribe_whisper(ref_audio_path)
         whisper_note = (L["whisper_note"].format(t=_ref_text)
                         if _ref_text else L["whisper_na"])
@@ -418,12 +474,9 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
     note_out = f"{whisper_note}\n{seed_line}".strip() if whisper_note else seed_line
 
     for i, key in enumerate(keys):
-        label = _model_label(key, lang)
-        short = label.split("—")[0].strip()
-        progress((i + 0.5) / len(keys), desc=f"({i + 1}/{len(keys)}) {short}")
-        slot_md[i] = f"**{label}**\n\n{L['generating']}"
+        slot_html[i] = _slot_html(labels[i], "generating", lang)
         dirty.add(i)
-        yield render(note_out)
+        yield render(_status_html(i, len(keys), shorts[i], lang), note_out)
         try:
             # Cùng seed cho mọi model → so sánh công bằng (cùng nhiễu khởi tạo).
             t0 = time.time()
@@ -431,15 +484,21 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
                                   gen_text_n, speed, nfe, seed=seed)
             gen_s = time.time() - t0
             sf.write(str(OUTPUT_DIR / f"{key}.wav"), wave, sr)
-            note = _quality_note(wave, sr, lang)
-            slot_md[i] = f"**{label}**\n\n{note}  ·  {L['gen_time'].format(s=gen_s)}"
+            slot_html[i] = _slot_html(labels[i], "done", lang,
+                                      metrics=_quality_parts(wave, sr, lang),
+                                      gen_s=gen_s)
             slot_audio[i] = (sr, wave)
         except Exception as e:
             traceback.print_exc()
-            slot_md[i] = f"**{label}**\n\n{L['slot_err'].format(e=e)}"
+            slot_html[i] = _slot_html(labels[i], "error", lang, err=e)
             slot_audio[i] = None
         dirty.add(i)
-        yield render(note_out)
+        if i + 1 < len(keys):
+            status = _status_html(i + 1, len(keys), shorts[i + 1], lang)
+        else:
+            status = _status_html(len(keys), len(keys), "", lang,
+                                  total_s=time.time() - t_start)
+        yield render(status, note_out)
 
 
 # ─── Song ngữ (i18n) ─────────────────────────────────────────────────────────────
@@ -497,6 +556,12 @@ I18N = {
         preparing="Đang chuẩn bị...",
         queued="Trong hàng đợi — engine nhanh sẽ chạy trước...",
         generating="Đang tạo giọng nói...",
+        queued_pill="Chờ đến lượt",
+        generating_pill="Đang tạo...",
+        done_pill="Hoàn tất",
+        error_pill="Lỗi",
+        status_running="Đang tạo {i}/{n}: {name}",
+        status_done="Xong cả {n} mô hình · tổng {s:.0f} giây",
     ),
     "en": dict(
         hero_sub=("Compare Vietnamese text-to-speech models head-to-head — listen to results "
@@ -550,6 +615,12 @@ I18N = {
         preparing="Preparing...",
         queued="Queued — faster engines run first...",
         generating="Generating speech...",
+        queued_pill="Queued",
+        generating_pill="Generating...",
+        done_pill="Done",
+        error_pill="Error",
+        status_running="Generating {i}/{n}: {name}",
+        status_done="All {n} models done · {s:.0f} s total",
     ),
 }
 
@@ -557,37 +628,106 @@ I18N = {
 # ─── Giao diện ──────────────────────────────────────────────────────────────────
 
 CSS = """
-.gradio-container {max-width: 1200px !important; margin: 0 auto !important;}
-#hero {border-radius: 18px; padding: 30px 30px 24px;
-  background: linear-gradient(135deg, #12365c 0%, #1f4e79 45%, #2e75b6 100%);
-  color: #ffffff; margin: 6px 0 4px;}
-#hero h1 {margin: 0 0 8px; font-size: 1.9rem; letter-spacing: .2px; color: #ffffff;}
-#hero p {margin: 0; opacity: .9; font-size: .98rem; line-height: 1.55; max-width: 900px;}
-#hero .badges {margin-top: 14px;}
-#hero .badges span {display: inline-block; margin: 0 8px 6px 0; padding: 5px 14px;
-  border-radius: 999px; background: rgba(255,255,255,.16); font-size: .78rem;
-  letter-spacing: .3px;}
+/* ───────────────── Design system ───────────────── */
+.gradio-container {max-width: 1240px !important; margin: 0 auto !important;}
+footer {display: none !important;}
+
+/* Hero */
+#hero {position: relative; overflow: hidden; border-radius: 20px; padding: 34px 34px 26px;
+  background: linear-gradient(135deg, #1e1b4b 0%, #312e81 42%, #4f46e5 100%);
+  color: #ffffff; margin: 6px 0 6px;
+  box-shadow: 0 12px 34px rgba(49, 46, 129, .35);}
+#hero::after {content: ""; position: absolute; right: -120px; top: -120px;
+  width: 340px; height: 340px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(139,92,246,.35) 0%, transparent 70%);}
+#hero h1 {margin: 0 0 10px; font-size: 2rem; letter-spacing: .2px; color: #ffffff;}
+#hero p {margin: 0; opacity: .92; font-size: .98rem; line-height: 1.6; max-width: 900px;}
+#hero .badges {margin-top: 16px; position: relative; z-index: 1;}
+#hero .badges span {display: inline-block; margin: 0 8px 6px 0; padding: 5px 15px;
+  border-radius: 999px; background: rgba(255,255,255,.13);
+  border: 1px solid rgba(255,255,255,.22); font-size: .78rem; letter-spacing: .3px;}
+
+/* Language toggle */
 #lang-row {display: flex; justify-content: flex-end !important; margin: 2px 0 0;}
 #lang-toggle {width: 300px !important; min-width: 300px !important;
   flex: 0 0 300px !important; margin-left: auto !important;
-  border: 2px solid #2e75b6 !important; border-radius: 12px !important;
+  border: 2px solid #6366f1 !important; border-radius: 14px !important;
   padding: 8px 16px !important; background: var(--background-fill-primary) !important;
-  box-shadow: 0 2px 10px rgba(46, 117, 182, .18) !important;}
+  box-shadow: 0 3px 14px rgba(99, 102, 241, .22) !important;}
 #lang-toggle .wrap {gap: 10px !important; flex-direction: row !important;}
 #lang-toggle label {font-weight: 600 !important; white-space: nowrap !important;}
+
+/* Panels & cards */
 .panel {border: 1px solid var(--border-color-primary) !important;
-  border-radius: 16px !important; padding: 16px !important;
+  border-radius: 18px !important; padding: 18px !important;
   background: var(--background-fill-primary) !important;
-  box-shadow: 0 4px 18px rgba(15, 43, 70, .05) !important;}
-.panel-title {font-weight: 700 !important; font-size: 1.02rem !important;
-  margin: 2px 0 4px !important;}
-#generate-btn {border-radius: 12px !important; font-weight: 700 !important;
-  letter-spacing: .2px !important;}
+  box-shadow: 0 6px 24px rgba(30, 27, 75, .07) !important;}
+.panel-title {font-weight: 700 !important; font-size: 1.05rem !important;
+  margin: 2px 0 6px !important; padding-left: 12px !important;
+  border-left: 4px solid #6366f1 !important;}
 .result-card {border: 1px solid var(--border-color-primary) !important;
-  border-radius: 14px !important; padding: 12px 14px 8px !important;
-  margin-bottom: 10px !important;
-  background: var(--background-fill-secondary) !important;}
-footer {display: none !important;}
+  border-radius: 16px !important; padding: 14px 16px 10px !important;
+  margin-bottom: 12px !important;
+  background: var(--background-fill-secondary) !important;
+  transition: border-color .25s ease, box-shadow .25s ease;}
+.result-card:hover {border-color: #6366f1 !important;
+  box-shadow: 0 4px 18px rgba(99, 102, 241, .14) !important;}
+
+/* Generate button */
+#generate-btn {border-radius: 14px !important; font-weight: 700 !important;
+  letter-spacing: .3px !important; font-size: 1.02rem !important;
+  background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important;
+  border: none !important; color: #fff !important;
+  box-shadow: 0 6px 18px rgba(79, 70, 229, .35) !important;
+  transition: transform .15s ease, box-shadow .15s ease !important;}
+#generate-btn:hover {transform: translateY(-1px);
+  box-shadow: 0 9px 24px rgba(79, 70, 229, .45) !important;}
+
+/* Status pills & chips (slot cards + status bar) */
+@keyframes vvcs-spin {to {transform: rotate(360deg);}}
+@keyframes vvcs-slide {0% {transform: translateX(-100%);} 100% {transform: translateX(400%);}}
+.spinner {display: inline-block; width: 12px; height: 12px; margin-right: 8px;
+  border: 2px solid rgba(129,140,248,.35); border-top-color: #6366f1;
+  border-radius: 50%; animation: vvcs-spin .8s linear infinite; vertical-align: -2px;}
+.slot-head {display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; margin: 2px 0 8px; flex-wrap: wrap;}
+.slot-title {font-weight: 700; font-size: .95rem; line-height: 1.4;}
+.pill {padding: 4px 13px; border-radius: 999px; font-size: .75rem;
+  font-weight: 600; white-space: nowrap;}
+.pill-queued {background: rgba(148,163,184,.16); color: #94a3b8;
+  border: 1px solid rgba(148,163,184,.3);}
+.pill-gen {background: rgba(99,102,241,.14); color: #818cf8;
+  border: 1px solid rgba(99,102,241,.35);}
+.pill-done {background: rgba(34,197,94,.13); color: #22c55e;
+  border: 1px solid rgba(34,197,94,.32);}
+.pill-err {background: rgba(239,68,68,.13); color: #ef4444;
+  border: 1px solid rgba(239,68,68,.32);}
+.indet {height: 4px; border-radius: 99px; overflow: hidden; margin: 4px 0 8px;
+  background: rgba(99,102,241,.12);}
+.indet > div {width: 30%; height: 100%; border-radius: 99px;
+  background: linear-gradient(90deg, #6366f1, #a78bfa);
+  animation: vvcs-slide 1.2s ease-in-out infinite;}
+.chips {display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 10px;}
+.chip {padding: 3px 11px; border-radius: 9px; font-size: .73rem;
+  background: rgba(148,163,184,.1); border: 1px solid var(--border-color-primary);}
+.chip-ok {background: rgba(34,197,94,.1); color: #16a34a;
+  border-color: rgba(34,197,94,.3); font-weight: 600;}
+.chip-warn {background: rgba(245,158,11,.12); color: #d97706;
+  border-color: rgba(245,158,11,.3); font-weight: 600;}
+.slot-err {font-size: .8rem; color: #ef4444; margin: 2px 0 8px; line-height: 1.5;}
+
+/* Overall status bar */
+#status-bar .status {border: 1px solid var(--border-color-primary); border-radius: 14px;
+  padding: 12px 14px; margin-bottom: 12px;
+  background: var(--background-fill-secondary);}
+#status-bar .status-row {display: flex; justify-content: space-between;
+  align-items: center; gap: 10px; margin-bottom: 9px; flex-wrap: wrap;}
+#status-bar .status-note {font-size: .78rem; opacity: .75;}
+#status-bar .bar {height: 6px; border-radius: 99px; overflow: hidden;
+  background: rgba(99,102,241,.12);}
+#status-bar .bar > div {height: 100%; border-radius: 99px;
+  background: linear-gradient(90deg, #4f46e5, #a78bfa);
+  transition: width .5s ease;}
 """
 
 
@@ -649,14 +789,18 @@ def create_ui():
             with gr.Column(scale=1, elem_classes=["panel"]):
                 results_hdr = gr.Markdown(f"### {L0['results_hdr']}",
                                           elem_classes=["panel-title"])
+                status_bar = gr.HTML("", elem_id="status-bar")
                 whisper_display = gr.Textbox(label=L0["runinfo"],
                                              interactive=False, lines=2)
+                _wave_opts = gr.WaveformOptions(
+                    waveform_color="#818cf8", waveform_progress_color="#4f46e5")
                 slot_cols, slot_infos, slot_audios = [], [], []
                 for i in range(MAX_SLOTS):
                     with gr.Column(visible=False, elem_classes=["result-card"]) as col:
-                        info = gr.Markdown("")
+                        info = gr.HTML("")
                         audio = gr.Audio(label=f"{L0['slot']} {i + 1}",
-                                         interactive=False, autoplay=(i == 0))
+                                         interactive=False, autoplay=(i == 0),
+                                         waveform_options=_wave_opts)
                     slot_cols.append(col)
                     slot_infos.append(info)
                     slot_audios.append(audio)
@@ -702,8 +846,8 @@ def create_ui():
                      btn, results_hdr, whisper_display, examples_acc] + slot_audios,
         )
 
-        # ── Tạo giọng: whisper_display + (cột, info, audio) cho từng slot ──
-        outputs = [whisper_display]
+        # ── Tạo giọng: status_bar + whisper_display + (cột, info, audio) từng slot ──
+        outputs = [status_bar, whisper_display]
         for i in range(MAX_SLOTS):
             outputs += [slot_cols[i], slot_infos[i], slot_audios[i]]
 
@@ -712,6 +856,11 @@ def create_ui():
             inputs=[models, ref_audio, ref_text, gen_text, speed, nfe, seed, lang_state],
             outputs=outputs,
             concurrency_limit=1,          # chạy tuần tự cho ổn định
+            # QUAN TRỌNG: tắt overlay loading của Gradio — trước đây nó phủ thanh
+            # tiến trình lên TẤT CẢ card kết quả cho tới khi event kết thúc, làm
+            # người dùng tưởng phải chờ đủ 6 mô hình. Trạng thái giờ hiển thị bằng
+            # status_bar + huy hiệu trên từng card, cập nhật theo từng yield.
+            show_progress="hidden",
         )
     return app
 
@@ -755,4 +904,8 @@ if __name__ == "__main__":
     app.queue(default_concurrency_limit=1)   # serialize toàn bộ request
     print(f"\nServer: http://localhost:{args.port}")
     app.launch(server_name=args.host, server_port=args.port, share=args.share,
-               theme=gr.themes.Soft())
+               theme=gr.themes.Soft(
+                   primary_hue="indigo", secondary_hue="violet", radius_size="lg",
+                   font=[gr.themes.GoogleFont("Be Vietnam Pro"),
+                         "ui-sans-serif", "system-ui", "sans-serif"],
+               ))

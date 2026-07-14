@@ -47,7 +47,7 @@ DEFAULT_SAMPLE_RATE = 24000       # Hz - chuẩn của F5-TTS
 DEFAULT_MIN_DURATION = 3.0        # giây - segment tối thiểu
 DEFAULT_MAX_DURATION = 10.0       # giây - segment tối đa (tránh OOM khi train)
 SILENCE_TOP_DB = 30               # ngưỡng dB để phát hiện silence
-MIN_SILENCE_LEN_SEC = 0.3         # khoảng lặng tối thiểu để coi là điểm cắt (giây)
+SILENCE_PAD_SEC = 0.15            # khoảng nghỉ chèn giữa các đoạn trong remove_silence()
 SUPPORTED_FORMATS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".wma"}
 
 
@@ -136,8 +136,8 @@ def remove_silence(
     if len(intervals) == 0:
         return np.array([], dtype=np.float32)
 
-    # Khoảng nghỉ ngắn chèn giữa các đoạn (0.15s) → giữ nhịp tự nhiên
-    pad_samples = int(0.15 * sr)
+    # Khoảng nghỉ ngắn chèn giữa các đoạn → giữ nhịp tự nhiên (xem SILENCE_PAD_SEC)
+    pad_samples = int(SILENCE_PAD_SEC * sr)
     padding = np.zeros(pad_samples, dtype=np.float32)
 
     chunks = []
@@ -187,7 +187,13 @@ def segment_audio(
         return [audio]
 
     # --- Chiến lược chính: Cắt theo khoảng lặng tự nhiên ---
-    min_silence_samples = int(MIN_SILENCE_LEN_SEC * sr)
+    # LƯU Ý: hàm này luôn nhận audio ĐÃ QUA remove_silence(), nghĩa là mọi khoảng
+    # lặng gốc (dù dài bao nhiêu) đã bị collapse về đúng SILENCE_PAD_SEC. Do đó,
+    # BẤT KỲ ranh giới đoạn nào librosa.effects.split() phát hiện được ở đây đều là
+    # một điểm nghỉ THẬT trong bản ghi gốc — không cần so ngưỡng độ dài khoảng lặng
+    # nữa. (Trước đây so `gap >= ngưỡng mẫu cố định` nhưng biên interval của librosa
+    # bị lượng tử hoá theo hop_length nên gap đo được LUÔN nhỏ hơn pad thực đã chèn
+    # → điều kiện không bao giờ đúng → mọi đoạn dài đều bị cắt cứng tại max_duration.)
     intervals = librosa.effects.split(audio, top_db=top_db,
                                       frame_length=2048, hop_length=512)
 
@@ -198,12 +204,8 @@ def segment_audio(
         current_pos = end  # vị trí kết thúc đoạn non-silent hiện tại
         current_dur = (current_pos - current_segment_start) / sr
 
-        # Kiểm tra khoảng lặng đủ dài giữa đoạn hiện tại và đoạn tiếp
-        has_silence_gap = False
-        if i < len(intervals) - 1:
-            next_start = intervals[i + 1][0]
-            gap = next_start - end
-            has_silence_gap = gap >= min_silence_samples
+        # Còn interval tiếp theo → ranh giới hiện tại là điểm nghỉ hợp lệ (xem trên).
+        has_silence_gap = i < len(intervals) - 1
 
         # Điều kiện cắt: đủ dài VÀ có điểm nghỉ tự nhiên
         if current_dur >= min_dur and has_silence_gap:

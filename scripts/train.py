@@ -36,7 +36,6 @@ import torchaudio
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.utils.tensorboard import SummaryWriter
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -802,14 +801,25 @@ def train(config: Dict[str, Any]):
     logger.info(f"📊 Total steps: {total_steps}")
 
     # -----------------------------------------------------------------
-    # TensorBoard writer
-    # -----------------------------------------------------------------
+    # TensorBoard writer (TÙY CHỌN — import LƯỜI trong try/except).
+    # `torch.utils.tensorboard.SummaryWriter` khi import có thể kích hoạt
+    # `tensorboard` dò tìm TensorFlow đã cài sẵn (Colab luôn có sẵn TF); nếu phiên
+    # bản `protobuf` trên máy mới hơn bản TF đó được build cùng (dễ xảy ra vì
+    # coqui-tts kéo theo protobuf mới), việc import sẽ NÉM LỖI ở tầng C-extension
+    # của protobuf/TensorFlow — không liên quan gì đến TensorBoard hay training.
+    # Vì log TensorBoard chỉ là tiện ích quan sát (không ảnh hưởng kết quả train),
+    # lỗi ở đây KHÔNG được phép làm crash toàn bộ quá trình huấn luyện.
     tb_writer = None
     if log_cfg.get("tensorboard", False) and accelerator.is_main_process:
-        log_dir = Path(log_cfg["log_dir"])
-        log_dir.mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(log_dir=str(log_dir))
-        logger.info(f"📈 TensorBoard: {log_dir}")
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            log_dir = Path(log_cfg["log_dir"])
+            log_dir.mkdir(parents=True, exist_ok=True)
+            tb_writer = SummaryWriter(log_dir=str(log_dir))
+            logger.info(f"📈 TensorBoard: {log_dir}")
+        except Exception as e:
+            logger.warning(f"⚠️ Không bật được TensorBoard ({type(e).__name__}: {e}); "
+                           f"tiếp tục training, chỉ log ra console (không ảnh hưởng kết quả).")
 
     # =================================================================
     # TRAINING LOOP

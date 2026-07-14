@@ -92,8 +92,8 @@ MAX_GEN_CHARS = 2000       # chặn văn bản quá dài (tránh treo trên CPU)
 def _discover_finetuned():
     found = []
     for ck in sorted(CHECKPOINT_DIR.glob("step_*/model.pt")):
-        step = ck.parent.name
-        found.append((f"ft_{step}", f"Fine-tune · {step}", ck))
+        step = ck.parent.name.replace("step_", "").lstrip("0") or "0"
+        found.append((f"ft_{ck.parent.name}", f"step {step}", ck))
     return found
 
 def build_registry():
@@ -131,13 +131,15 @@ def build_registry():
             "engine": "bark",
         },
     }
-    # Các checkpoint fine-tune demo (huấn luyện trên dữ liệu giả) KHÔNG xuất hiện
-    # trên site chính — chỉ bật lại khi cần nghiên cứu: VVCS_SHOW_DEMO_CKPTS=1.
-    if os.environ.get("VVCS_SHOW_DEMO_CKPTS") == "1":
-        for key, label, ck in _discover_finetuned():
-            reg[key] = {"label": f"F5-TTS {label} (dữ liệu demo)",
-                        "label_en": f"F5-TTS {label} (demo data)",
-                        "engine": "f5tts", "ckpt": ck}
+    # Checkpoint fine-tune trong checkpoints/step_*/model.pt LUÔN hiển thị: các
+    # checkpoint huấn luyện trên dữ liệu giả trước đây đã bị xoá khỏi đĩa (03/07/2026),
+    # nên bất kỳ checkpoint nào xuất hiện ở đây từ nay về sau chắc chắn là kết quả
+    # fine-tune THẬT của người dùng trên giọng của chính họ — không còn lý do để ẩn
+    # hay gắn nhãn "dữ liệu demo" mặc định nữa.
+    for key, label, ck in _discover_finetuned():
+        reg[key] = {"label": f"Giọng cá nhân (tinh chỉnh, {label})",
+                    "label_en": f"Personal voice (fine-tuned, {label})",
+                    "engine": "f5tts", "ckpt": ck}
     return reg
 
 # Engine nào CẦN audio mẫu (các engine còn lại dùng giọng cố định/preset).
@@ -747,7 +749,7 @@ def _model_choices(lang: str):
 def create_ui():
     L0 = I18N["vi"]
 
-    with gr.Blocks(title=APP_TITLE, css=CSS) as app:
+    with gr.Blocks(title=APP_TITLE) as app:
         lang_state = gr.State("vi")
 
         with gr.Row(elem_id="lang-row"):
@@ -903,6 +905,7 @@ if __name__ == "__main__":
     app.queue(default_concurrency_limit=1)   # serialize toàn bộ request
     print(f"\nServer: http://localhost:{args.port}")
     app.launch(server_name=args.host, server_port=args.port, share=args.share,
+               css=CSS,
                theme=gr.themes.Soft(
                    primary_hue="indigo", secondary_hue="violet", radius_size="lg",
                    font=[gr.themes.GoogleFont("Be Vietnam Pro"),

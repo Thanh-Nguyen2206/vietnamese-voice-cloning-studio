@@ -1,0 +1,84 @@
+# =============================================================================
+# Vietnamese Voice Cloning Studio - Training Configuration
+#
+# Hardware Target: NVIDIA T4 (16GB VRAM)
+# Đã tối ưu: batch_size nhỏ + gradient accumulation + FP16
+# =============================================================================
+
+# --- Model ---
+# Base model pre-trained tiếng Việt từ HuggingFace
+model:
+  repo_id: "hynt/F5-TTS-Vietnamese-ViVoice"
+  # Tên file thực tế trong repo (verified với list_repo_files)
+  ckpt_filename: "model_last.pt"
+  # config.json là vocab plain text (1 token/dòng), không phải JSON
+  vocab_filename: "config.json"
+
+  # Kiến trúc DiT (PHẢI khớp với pre-trained model, KHÔNG được đổi)
+  dit:
+    dim: 1024            # Embedding dimension
+    depth: 22            # Số lượng DiT blocks
+    heads: 16            # Số attention heads
+    ff_mult: 2           # Feed-forward multiplier
+    text_dim: 512        # Text embedding dimension
+    conv_layers: 4       # Số conv layers trong text encoder
+    # Hai field dưới đây BẮT BUỘC để forward pass khớp checkpoint ViVoice.
+    text_mask_padding: false
+    pe_attn_head: 1
+
+# --- Audio ---
+# Cấu hình Mel Spectrogram (PHẢI khớp với pre-trained model)
+audio:
+  sample_rate: 24000     # Hz
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  n_mel_channels: 100
+
+# --- Data ---
+data:
+  processed_dir: "data/processed"                # Thư mục chứa audio segments
+  metadata_path: "data/metadata/metadata.csv"    # File CSV từ Phase 2
+  num_workers: 2                                 # DataLoader workers
+  validation_split: 0.1                          # split deterministic theo seed
+
+# --- Training ---
+# ⚠️ CẤU HÌNH TỐI ƯU CHO T4 (16GB VRAM)
+training:
+  epochs: 100
+  batch_size: 1                    # Giữ nhỏ vì VRAM hạn chế
+  gradient_accumulation_steps: 8   # Effective batch = 1 × 8 = 8
+  
+  # Optimizer (AdamW)
+  learning_rate: 1.0e-5            # LR nhỏ cho fine-tuning (tránh catastrophic forgetting)
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+  # Learning Rate Scheduler
+  warmup_steps: 200                # Warm-up tuyến tính từ 0 → lr
+  scheduler: "cosine"              # cosine annealing sau warm-up
+  min_lr: 1.0e-7                   # LR tối thiểu cuối schedule
+  
+  # Gradient
+  max_grad_norm: 1.0               # Gradient clipping (ổn định training)
+  
+  # Mixed Precision (BẮT BUỘC cho T4)
+  # T4 hỗ trợ FP16 (compute capability 7.5), KHÔNG hỗ trợ BF16
+  mixed_precision: "fp16"
+  
+  # Seed
+  seed: 42
+
+# --- Checkpoint ---
+checkpoint:
+  save_dir: "checkpoints"
+  save_every_n_steps: 500          # Lưu checkpoint mỗi 500 global steps
+  keep_last_n: 3                   # Chỉ giữ 3 checkpoint gần nhất (tiết kiệm disk)
+  resume: null                     # null = không resume; dùng CLI --resume latest hoặc PATH
+
+# --- Logging ---
+logging:
+  log_dir: "logs"
+  log_every_n_steps: 10            # In loss mỗi 10 steps
+  tensorboard: true                # Bật TensorBoard logging

@@ -15,17 +15,21 @@ Cach chay:
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 from docx import Document
-from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parent.parent
-RESULTS = ROOT / "outputs/evaluation/results.json"
-FIG = ROOT / "outputs/evaluation/figures_en"
+# Uu tien ket qua benchmark THAT nhieu cau; fallback ve audit n=1 neu chua co.
+_BENCH = ROOT / "outputs/benchmark/evaluation/results.json"
+RESULTS = _BENCH if _BENCH.is_file() else ROOT / "outputs/evaluation/results.json"
+FIG = (ROOT / "outputs/benchmark/figures_en"
+       if _BENCH.is_file() else ROOT / "outputs/evaluation/figures_en")
 OUT = ROOT / "docs/DSP391m_Report3_Model_and_Results.docx"
 
 ACCENT = RGBColor(0x1B, 0x49, 0x65)   # deep academic blue
@@ -149,8 +153,26 @@ def set_cell(cell, text, *, bold=False, align="left", color=None, size=10.5):
 # -------------------------------------------------------------------- build ---
 def main() -> int:
     data = json.loads(RESULTS.read_text(encoding="utf-8"))
-    summ = {r["engine"]: r for r in data["summary"]}
+    ok_rows = [r for r in data.get("results", []) if r.get("status") == "ok"]
+
+    def _st(engine, key):
+        vals = [float(r[key]) for r in ok_rows if r["engine"] == engine and r.get(key) is not None]
+        if not vals:
+            return {"mean": None, "std": 0.0, "median": None, "n": 0}
+        return {"mean": statistics.mean(vals),
+                "std": statistics.pstdev(vals) if len(vals) > 1 else 0.0,
+                "median": statistics.median(vals), "n": len(vals)}
+
+    summ = {}
+    for e in {r["engine"] for r in ok_rows}:
+        summ[e] = {
+            "wer": _st(e, "wer"), "cer": _st(e, "cer"),
+            "secs": _st(e, "speaker_similarity"),
+            "time": _st(e, "inference_time"), "rtf": _st(e, "real_time_factor"),
+            "n": sum(1 for r in ok_rows if r["engine"] == e),
+        }
     engines = [e for e in ENGINE_ORDER if e in summ]
+    n_sentences = max((summ[e]["n"] for e in engines), default=0)
 
     doc = Document()
     for section in doc.sections:
@@ -175,8 +197,39 @@ def main() -> int:
                     "Results · Conclusion"); r.italic = True; r.font.size = Pt(12)
     sub.paragraph_format.space_after = Pt(2)
 
-    by = doc.add_paragraph(); by.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    by.add_run("Group 4 · FPT University · Summer 2026").font.size = Pt(11)
+    doc.add_paragraph()
+
+    # ---- Cover info box (bordered table, no role column) ---------------------
+    info = [
+        ("Course", ["DSP391m - Data Science Capstone Project"]),
+        ("Team Members", ["Nguyễn Hoàng Thanh - SE172535",
+                          "Trương Thanh Tuấn - SE182217",
+                          "Nguyễn Thị Vân Anh - DE18037"]),
+        ("Instructor", ["Nguyễn Quốc Trung"]),
+        ("Academic Term", ["Summer 2026"]),
+    ]
+    box = doc.add_table(rows=len(info), cols=2)
+    box.style = "Table Grid"
+    box.alignment = WD_TABLE_ALIGNMENT.CENTER
+    box.autofit = False
+    for i, (label, values) in enumerate(info):
+        lc, vc = box.rows[i].cells
+        lc.width = Inches(1.9)
+        vc.width = Inches(4.4)
+        # label cell
+        lc.text = ""
+        pl = lc.paragraphs[0]
+        pl.paragraph_format.space_after = Pt(2)
+        rl = pl.add_run(f"{label}:"); rl.font.size = Pt(11.5)
+        # value cell (may span several lines, e.g. team members)
+        vc.text = ""
+        for k, val in enumerate(values):
+            pv = vc.paragraphs[0] if k == 0 else vc.add_paragraph()
+            pv.paragraph_format.space_after = Pt(2)
+            rv = pv.add_run(val); rv.font.size = Pt(11.5)
+        # vertical centering for tidy single-line rows
+        for cell in (lc, vc):
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
     doc.add_paragraph()
 
     # ---- Project Title -------------------------------------------------------
@@ -185,23 +238,6 @@ def main() -> int:
               "Vietnamese speaker's voice from a short reference recording using F5-TTS, and "
               "benchmarks it against five additional text-to-speech engines under identical "
               "inputs with an objective, reproducible evaluation harness.")
-
-    # ---- Team Members --------------------------------------------------------
-    doc.add_heading("Team Members", level=1)
-    body(doc, "Group 4, DSP391m. Please complete the table below with each member's full name "
-              "(first, then last) and role before submission.", italic=True, color=MUTED)
-    tm = doc.add_table(rows=4, cols=3); tm.style = "Light Grid Accent 1"
-    tm.alignment = WD_TABLE_ALIGNMENT.CENTER
-    for j, h in enumerate(["No.", "Full name", "Role / responsibility"]):
-        set_cell(tm.rows[0].cells[j], h, bold=True, color=RGBColor(255, 255, 255))
-        shade(tm.rows[0].cells[j], "1B4965")
-    roles = ["Modeling & inference pipeline", "Data preparation & fine-tuning",
-             "Evaluation & visualization"]
-    for i in range(1, 4):
-        set_cell(tm.rows[i].cells[0], str(i))
-        set_cell(tm.rows[i].cells[1], "⟨member name⟩", color=MUTED)
-        set_cell(tm.rows[i].cells[2], roles[i - 1])
-    doc.add_paragraph()
 
     # ---- Introduction and Background ----------------------------------------
     doc.add_heading("1.  Introduction and Background", level=1)
@@ -318,10 +354,11 @@ def main() -> int:
               "the official checkpoint; NaN/Inf losses abort immediately; each checkpoint records a JSON "
               "manifest of base model, architecture, vocabulary size, config, git commit, step, validation "
               "loss and dataset summary for full provenance.")
-    body(doc, "Honest status: the pipeline is hardened and unit-tested at the component level but has not "
-              "yet been verified end-to-end on real speaker data with a GPU (blocked by the absence of "
-              "collected speech). Accordingly, the results in Section 9 characterize the zero-shot base "
-              "model, not a fine-tuned one; no fine-tuning improvement is claimed.", italic=True, color=MUTED)
+    body(doc, "Honest status: the fine-tuning pipeline is established and verified at the code-path level "
+              "(its pure components are unit-tested), but it has not yet been run end-to-end on real "
+              "speaker data with a GPU (blocked by the absence of collected speech). Accordingly, the "
+              "results in Section 9 characterize the zero-shot base model, not a fine-tuned one; no "
+              "fine-tuning improvement is claimed.", italic=True, color=MUTED)
 
     # ---- 8. MODEL EVALUATION AND FINE-TUNING ---------------------------------
     doc.add_heading("8.  Model Evaluation and Fine-Tuning", level=1)
@@ -370,93 +407,171 @@ def main() -> int:
               "generative model on tens of minutes of audio (the k× training cost is prohibitive and the "
               "signal is generative, not a classification label). Its role is filled by (i) a deterministic "
               "held-out validation split monitored every epoch, with the best checkpoint chosen by "
-              "validation loss, and (ii) an independent fixed test set of diverse sentences — short, "
-              "numeric, decimal, date, abbreviation, proper-noun, interrogative, compound and long — for "
-              "post-hoc WER/CER/SECS evaluation.")
+              "validation loss, and (ii) an independent fixed test set of diverse sentences — greeting, "
+              "general, numeric, date, interrogative, compound and long — used for the post-hoc "
+              "WER/CER/SECS benchmark in Section 9.")
 
     # ---- 9. RESULTS INTERPRETATION AND VISUALIZATION -------------------------
-    doc.add_heading("9.  Results Interpretation and Visualization", level=1)
-    body(doc, "All six engines synthesize the same 17-word sentence from the same reference sample under "
-              "a fixed seed (42). Table 2 reports the objective results (values read directly from "
-              "outputs/evaluation/results.json); Figures 1–4 visualize them.")
+    # Formatting + data-driven ranking helpers (report BOTH median and mean).
+    def pct_mm(d):
+        if d["median"] is None:
+            return "—"
+        return f"{d['median']*100:.1f} / {d['mean']*100:.1f}"
 
-    # Table 2 (from results.json)
-    rt = doc.add_table(rows=1 + len(engines), cols=7); rt.style = "Light Grid Accent 1"
+    def secs_fmt(d):
+        return "—" if d["mean"] is None else f"{d['mean']:.3f}"
+
+    def rank(metric, stat, *, best="min"):
+        pairs = [(e, summ[e][metric][stat]) for e in engines if summ[e][metric][stat] is not None]
+        pairs.sort(key=lambda t: t[1], reverse=(best == "max"))
+        return pairs
+
+    wer_med_rank = rank("wer", "median", best="min")
+    wer_mean_rank = rank("wer", "mean", best="min")
+    secs_rank = rank("secs", "mean", best="max")
+    best_wer_med_e = wer_med_rank[0][0]
+    best_wer_mean_e = wer_mean_rank[0][0]
+    best_secs_e, best_secs_v = secs_rank[0]
+    cloning = [e for e in engines if ENGINE_TYPE[e] == "voice cloning"]
+    fixed = [e for e in ("mms", "piper", "edge") if e in summ]
+    fixed_secs = [summ[e]["secs"]["mean"] for e in fixed if summ[e]["secs"]["mean"] is not None]
+
+    def pctv(engine, metric, stat):
+        return summ[engine][metric][stat] * 100
+
+    doc.add_heading("9.  Results Interpretation and Visualization", level=1)
+    body(doc, f"Every engine synthesizes the SAME set of {n_sentences} diverse Vietnamese sentences "
+              f"(greeting, general, number, date, question, compound and long) from the SAME reference "
+              f"sample under a fixed seed (42) and, for F5-TTS, a fixed NFE (32). Whisper re-transcribes "
+              f"each output; metrics are computed per sentence and aggregated. Because a few hard sentences "
+              f"(numbers, dates) legitimately inflate the average, Table 2 reports WER/CER as "
+              f"median / mean, and Figure 5 shows the full per-sentence spread. Values are read directly "
+              f"from {RESULTS.name}.")
+
+    rt = doc.add_table(rows=1 + len(engines), cols=8); rt.style = "Light Grid Accent 1"
     rt.alignment = WD_TABLE_ALIGNMENT.CENTER
-    for j, h in enumerate(["Engine", "Type", "WER ↓", "CER ↓", "SECS ↑", "Time (s)", "RTF ↓"]):
-        set_cell(rt.rows[0].cells[j], h, bold=True, color=RGBColor(255, 255, 255), align="center")
+    for j, h in enumerate(["Engine", "Type", "WER% ↓", "CER% ↓", "SECS ↑", "Time (s)", "RTF ↓", "N"]):
+        set_cell(rt.rows[0].cells[j], h, bold=True, color=RGBColor(255, 255, 255), align="center", size=9)
         shade(rt.rows[0].cells[j], "1B4965")
-    # best values for emphasis
-    best_wer = min(summ[e]["mean_wer"] for e in engines)
-    best_cer = min(summ[e]["mean_cer"] for e in engines)
-    best_secs = max((summ[e]["mean_speaker_similarity"] or 0) for e in engines)
     for i, e in enumerate(engines, start=1):
         s = summ[e]
         cells = rt.rows[i].cells
-        set_cell(cells[0], ENGINE_LABEL[e], bold=True)
-        set_cell(cells[1], ENGINE_TYPE[e])
-        set_cell(cells[2], f"{s['mean_wer']:.3f}", align="center",
-                 bold=s["mean_wer"] == best_wer, color=ACCENT if s["mean_wer"] == best_wer else None)
-        set_cell(cells[3], f"{s['mean_cer']:.3f}", align="center",
-                 bold=s["mean_cer"] == best_cer, color=ACCENT if s["mean_cer"] == best_cer else None)
-        secs = s["mean_speaker_similarity"] or 0
-        set_cell(cells[4], f"{secs:.3f}", align="center",
-                 bold=secs == best_secs, color=ACCENT if secs == best_secs else None)
-        set_cell(cells[5], f"{s['mean_inference_time']:.1f}", align="center")
-        set_cell(cells[6], f"{s['mean_real_time_factor']:.2f}", align="center")
-        if e == "f5tts":
+        set_cell(cells[0], ENGINE_LABEL[e], bold=True, size=9)
+        set_cell(cells[1], ENGINE_TYPE[e], size=8.5)
+        set_cell(cells[2], pct_mm(s["wer"]), align="center", size=9,
+                 bold=e == best_wer_med_e, color=ACCENT if e == best_wer_med_e else None)
+        set_cell(cells[3], pct_mm(s["cer"]), align="center", size=9)
+        set_cell(cells[4], secs_fmt(s["secs"]), align="center", size=9,
+                 bold=e == best_secs_e, color=ACCENT if e == best_secs_e else None)
+        set_cell(cells[5], f"{s['time']['mean']:.1f}" if s["time"]["mean"] is not None else "—",
+                 align="center", size=9)
+        set_cell(cells[6], f"{s['rtf']['mean']:.2f}" if s["rtf"]["mean"] is not None else "—",
+                 align="center", size=9)
+        set_cell(cells[7], str(s["n"]), align="center", size=9)
+        if e in cloning:
             for c in cells:
                 shade(c, "E7EEF2")
-    caption(doc, "Table 2. Objective results: six engines, identical sentence / seed / reference. "
-                 "Blue marks the best value per column.")
+    caption(doc, f"Table 2. Objective results over N={n_sentences} sentences (identical text / seed / "
+                 f"reference). WER% and CER% shown as median / mean. Voice-cloning engines are shaded; "
+                 f"blue marks the best median WER and the best SECS.")
 
     figure(doc, "wer_cer.png",
-           "Figure 1. Intelligibility via ASR round-trip. F5-TTS attains the lowest WER (5.9%); the "
-           "XTTS/MMS/Piper/Edge cluster sits near 11.8%; Bark exceeds 100% (cannot read Vietnamese).")
+           f"Figure 1. Intelligibility via ASR round-trip (bars = mean, whiskers = std over "
+           f"{n_sentences} sentences). The strong engines cluster closely; Bark (no Vietnamese) is the "
+           f"clear lower bound.")
     figure(doc, "speaker_similarity.png",
-           "Figure 2. Speaker similarity (SECS). Only F5-TTS (0.837) and XTTS-v2 (0.888) enter the "
-           "voice-cloning region (>0.75); fixed-voice engines score ≈0.56–0.62.")
+           f"Figure 2. Speaker similarity (SECS). Only the two cloning engines, F5-TTS "
+           f"({summ['f5tts']['secs']['mean']:.3f}) and XTTS-v2 ({summ['xtts']['secs']['mean']:.3f}), "
+           f"enter the voice-cloning region (>0.75); fixed-voice engines fall well below it.")
     figure(doc, "speed_rtf.png",
-           "Figure 3. Generation speed (RTF, log scale). Piper/MMS/Edge run faster than real time on "
-           "CPU; F5-TTS is slowest (quality and multi-step flow matching), expected to drop on GPU.")
+           "Figure 3. Generation speed (RTF, log scale; lower is faster). Fixed-voice engines run at or "
+           "faster than real time on CPU; the flow-matching cloning models are slower on CPU and are "
+           "expected to speed up substantially on GPU.")
     figure(doc, "tradeoff.png",
-           "Figure 4. The central trade-off — intelligibility (1−WER) vs. speaker identity; bubble "
-           "size ∝ speed. Only F5-TTS and XTTS-v2 reach the top-right; Bark falls to the bottom.")
+           "Figure 4. The central trade-off — intelligibility (1−mean WER) vs. speaker identity; bubble "
+           "size ∝ speed. Speaker similarity, not intelligibility, is what separates cloning from "
+           "fixed-voice engines.")
+    figure(doc, "wer_distribution.png",
+           f"Figure 5. Per-sentence WER across the {n_sentences} sentences (each dot is one sentence; the "
+           f"bar is the mean). It visualizes uncertainty: most sentences score low, while a few hard ones "
+           f"(numbers/dates) pull the mean up — which is why the median is the more robust summary.")
 
     doc.add_heading("9.1  Insights and Implications", level=2)
-    bullet(doc, "F5-TTS wins on balance — the only engine simultaneously the most intelligible "
-                "(WER 5.9%) and near the top on identity (SECS 0.837), exactly the joint objective of "
-                "voice cloning.")
-    bullet(doc, "XTTS-v2 is a strong, faster alternative — highest SECS (0.888) and ~5× faster than "
-                "F5-TTS on CPU, but double the WER; the right pick when identity and speed outweigh accuracy.")
-    bullet(doc, "Fixed-voice TTS is not cloning — MMS/Piper/Edge are intelligible and very fast "
-                "(RTF < 1) yet score SECS ≈ 0.6, confirming they do not reproduce the reference speaker.")
-    bullet(doc, "CER stays below WER for every good engine — F5-TTS errs chiefly on the first word "
-                "(“Trí”→“Chí”, a regional tr/ch merge), a pronunciation artifact, "
-                "not an intelligibility failure.")
-    bullet(doc, "The metrics catch real failure — Bark is automatically flagged (WER > 100%, lowest "
-                "SECS), showing the harness genuinely separates broken from working systems.")
-    body(doc, "Uncertainty: this is a pilot-scale audit (one sentence per engine), so confidence "
-              "intervals are not yet available; Whisper itself errs (WER/CER are upper bounds); SECS is "
-              "relative; and speed is measured on CPU including first-load overhead. A ≥12-sentence set is "
-              "prepared to report mean ± standard deviation.", italic=True, color=MUTED)
+    bullet(doc, f"Speaker identity is the decisive axis — only the two voice-cloning engines exceed the "
+                f"0.75 cloning threshold (F5-TTS {summ['f5tts']['secs']['mean']:.3f}, XTTS-v2 "
+                f"{summ['xtts']['secs']['mean']:.3f}), whereas the fixed-voice engines score "
+                f"≈{min(fixed_secs):.2f}–{max(fixed_secs):.2f} — they render a default voice, not the "
+                f"reference speaker. This is the core voice-cloning result.")
+    bullet(doc, f"Intelligibility is broadly comparable among the strong engines — median WER for "
+                f"F5-TTS ({pctv('f5tts','wer','median'):.1f}%) and XTTS-v2 "
+                f"({pctv('xtts','wer','median'):.1f}%) is close to the best fixed-voice engines, and on "
+                f"{n_sentences} sentences these gaps are within noise. F5-TTS has the lowest median WER; "
+                f"XTTS-v2 the lowest mean — effectively a tie.")
+    bullet(doc, "Median vs. mean matters — means are inflated by a few hard sentences (numbers and dates) "
+                "where the spoken form and Whisper's transcription legitimately differ (Figure 5); the "
+                "median is the more robust central tendency here.")
+    bullet(doc, f"Cost of quality — the cloning engines are slower on CPU (F5-TTS RTF "
+                f"{summ['f5tts']['rtf']['mean']:.1f}, XTTS-v2 {summ['xtts']['rtf']['mean']:.1f}) than the "
+                f"fixed-voice engines (RTF < 1); XTTS-v2 is the faster of the two on CPU.")
+    bullet(doc, "The harness catches real failure — the deliberately weak baseline (Bark, no Vietnamese "
+                "support) is separated automatically by very high WER and the lowest SECS, evidence that "
+                "the metrics measure something real rather than rewarding every engine equally.")
 
-    # ---- 10. CONCLUSION AND RECOMMENDATIONS ----------------------------------
-    doc.add_heading("10.  Conclusion and Recommendations", level=1)
-    lead(doc, "Key findings", "F5-TTS ViVoice is the right primary model: it leads on intelligibility "
-         "and ranks in the top tier on speaker identity — the only engine to optimize both axes at once. "
-         "The project also delivers a reproducible objective-evaluation framework that converts subjective "
-         "impressions into verifiable measurements and surfaced two subtle, high-impact defects.")
-    lead(doc, "Recommendations", "Use F5-TTS when both intelligibility and identity matter (enable GPU, "
-         "raise NFE to 48–64 for long sentences); use XTTS-v2 when identity and speed dominate; use "
-         "Piper/MMS for real-time offline reading that does not need a specific voice; do not use Bark for "
-         "Vietnamese. Provide a clean 5–10 s single-speaker reference and an accurate transcript.")
-    lead(doc, "Reflection and future work", "The most valuable outcome was establishing an objective "
-         "yardstick, which made subtle defects visible and keeps future claims evidence-based. Next, in "
-         "priority order: (1) scale the test set from 1 to ≥12 diverse sentences for mean ± std reporting; "
-         "(2) collect 30–60 minutes of real speaker audio and run fine-tuning end-to-end on GPU, measuring "
-         "WER/CER/SECS before vs. after; (3) add subjective MOS listening tests; (4) optimize F5-TTS "
-         "latency on GPU; (5) package the system (Docker / Hugging Face Spaces) for setup-free demos.")
+    doc.add_heading("9.2  Limitations and Uncertainty", level=2)
+    bullet(doc, f"Test-set scale — results cover {n_sentences} sentences per engine; error bars (Figure 1) "
+                "and the distribution (Figure 5) quantify spread, but a larger, category-balanced set would "
+                "tighten the estimates and enable significance testing.")
+    bullet(doc, "ASR is imperfect — Whisper itself mis-transcribes, especially tones, so WER/CER are "
+                "upper bounds on the true error and are most meaningful when compared across engines.")
+    bullet(doc, "SECS is relative — it is a similarity score between embeddings, not biometric proof, "
+                "and it does not replace subjective human listening (a MOS study remains future work).")
+    bullet(doc, "Speed is CPU-measured — inference time and RTF are CPU figures (and the first call per "
+                "engine includes model-load overhead); absolute latency will differ on GPU.")
+    bullet(doc, "Base model only — these numbers characterize the zero-shot base model; the fine-tuning "
+                "pipeline is established and verified at the code-path level but not yet run end-to-end on "
+                "real speaker data with a GPU, so no fine-tuning improvement is claimed.")
+
+    # ---- 10. CONCLUSION (PROVISIONAL) ----------------------------------------
+    doc.add_heading("10.  Conclusion and Recommendations (Provisional)", level=1)
+    body(doc, f"These are provisional conclusions reflecting the current project status — an objective "
+              f"benchmark over {n_sentences} sentences on the zero-shot base model — not a final, "
+              f"large-scale or fine-tuned evaluation.", italic=True, color=MUTED)
+    lead(doc, "Key findings (current status)",
+         f"On this {n_sentences}-sentence benchmark, the two voice-cloning engines — F5-TTS and XTTS-v2 — "
+         f"are the only systems that reproduce the reference speaker (SECS "
+         f"{summ['f5tts']['secs']['mean']:.3f} and {summ['xtts']['secs']['mean']:.3f}, both above the 0.75 "
+         f"threshold), while the fixed-voice engines do not. Intelligibility is comparable across the "
+         f"strong engines: F5-TTS gives the lowest median WER ({pctv('f5tts','wer','median'):.1f}%) and "
+         f"XTTS-v2 the lowest mean, an effective tie. Just as important as any single winner, the project "
+         f"delivers a reproducible objective-evaluation framework that turns subjective impressions into "
+         f"verifiable measurements and surfaced two subtle, high-impact defects during development.")
+    lead(doc, "Recommendations",
+         f"For Vietnamese voice cloning, F5-TTS is the recommended primary engine — it matches the field "
+         f"on intelligibility (lowest median WER), reaches top-tier speaker similarity, and is "
+         f"pre-trained on Vietnamese; enable GPU and raise NFE to 48–64 for long sentences. XTTS-v2 is an "
+         f"equally strong, faster alternative when speaker likeness and CPU speed matter most. Use "
+         f"Piper/MMS/Edge for real-time offline reading that does not need a specific voice, and avoid "
+         f"Bark for Vietnamese. Always provide a clean 5–10 s single-speaker reference with an accurate "
+         f"transcript.")
+    lead(doc, "Reflection and future work",
+         "Establishing an objective yardstick was the most valuable outcome: it made subtle defects visible "
+         "and keeps every claim evidence-based. Next, in priority order: (1) enlarge and balance the test "
+         "set and report confidence intervals / significance; (2) collect 30–60 minutes of real speaker "
+         "audio and run fine-tuning end-to-end on GPU, measuring WER/CER/SECS before vs. after; (3) add "
+         "subjective MOS listening tests; (4) optimize cloning-engine latency on GPU; (5) package the "
+         "system for setup-free demos.")
+
+    # ---- 11. License and Ethics ----------------------------------------------
+    doc.add_heading("11.  License and Ethical Considerations", level=1)
+    lead(doc, "License", "The base model hynt/F5-TTS-Vietnamese-ViVoice is released under "
+         "CC-BY-NC-SA-4.0: this project is strictly non-commercial and for education/research only. Any "
+         "commercial use would require replacing the model with an appropriately licensed one. Comparison "
+         "engines retain their own licenses (e.g., Coqui, Meta MMS, Piper, Bark) and Edge-TTS is a "
+         "cloud service subject to Microsoft's terms.")
+    lead(doc, "Ethics", "Voice cloning can be misused for impersonation. Users must clone only their own "
+         "voice or a voice they have explicit permission to use; generated audio should be disclosed as "
+         "synthetic where appropriate. Objective similarity scores here are for quality assessment only "
+         "and must not be treated as identity verification.")
 
     # ---- References ----------------------------------------------------------
     doc.add_heading("References", level=1)
@@ -491,12 +606,15 @@ def main() -> int:
     doc.add_heading("Appendices", level=1)
     doc.add_heading("Appendix A — Reproducing the results", level=2)
     for line in [
-        "# 1. Evaluate generated audio → results.json + report.md",
-        "python scripts/evaluate.py --manifest evaluation/audit_existing_outputs.json \\",
-        "    --output-dir outputs/evaluation",
-        "# 2. Render the figures (English labels)",
-        "python scripts/plot_results.py --lang en --output-dir outputs/evaluation/figures_en",
-        "# 3. Rebuild this document",
+        "# 1. Generate audio for all engines over the multi-sentence test set (CPU)",
+        "python scripts/run_benchmark.py",
+        "# 2. Evaluate: WER/CER (Whisper) + speaker similarity (Resemblyzer) + RTF",
+        "python scripts/evaluate.py --manifest outputs/benchmark/manifest.json \\",
+        "    --output-dir outputs/benchmark/evaluation",
+        "# 3. Render the figures (English labels, mean ± std)",
+        "python scripts/plot_results.py --results outputs/benchmark/evaluation/results.json \\",
+        "    --output-dir outputs/benchmark/figures_en --lang en",
+        "# 4. Rebuild this document",
         "python scripts/build_report_docx.py",
     ]:
         p = doc.add_paragraph(); r = p.add_run(line)

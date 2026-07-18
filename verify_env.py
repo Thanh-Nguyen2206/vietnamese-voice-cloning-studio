@@ -10,8 +10,8 @@ Chạy script này SAU KHI hoàn tất setup.sh
 =============================================================================
 """
 
-import sys
 import importlib
+import sys
 from typing import Tuple
 
 
@@ -28,6 +28,12 @@ def check_package(package_name: str, import_name: str = None) -> Tuple[bool, str
     """
     name = import_name or package_name
     try:
+        if name == "TTS":
+            # Same compatibility shim used by engines.py for current transformers.
+            import torch
+            import transformers.pytorch_utils as pytorch_utils
+            if not hasattr(pytorch_utils, "isin_mps_friendly"):
+                pytorch_utils.isin_mps_friendly = torch.isin
         module = importlib.import_module(name)
         # Lấy version nếu có
         version = getattr(module, "__version__", "installed (no version info)")
@@ -104,15 +110,18 @@ def main():
         ("soundfile",      "soundfile",     "CRITICAL"),
         ("pydub",          "pydub",         "REQUIRED"),
         
-        # === Vietnamese NLP ===
-        ("underthesea",    "underthesea",   "REQUIRED"),
-        
         # === Web UI ===
         ("Gradio",         "gradio",        "REQUIRED"),
         
         # === Evaluation ===
         ("resemblyzer",    "resemblyzer",   "REQUIRED"),
         ("jiwer",          "jiwer",         "OPTIONAL"),
+        ("faster-whisper", "faster_whisper", "REQUIRED"),
+
+        # === Optional comparison engines ===
+        ("Coqui TTS",      "TTS",           "OPTIONAL"),
+        ("Piper",          "piper",         "OPTIONAL"),
+        ("Edge-TTS",       "edge_tts",      "OPTIONAL"),
         
         # === Utilities ===
         ("matplotlib",     "matplotlib",    "REQUIRED"),
@@ -153,6 +162,17 @@ def main():
     # =========================================================================
     print()
     print("-" * 65)
+    try:
+        import torch
+        import torchaudio
+        torch_mm = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+        audio_mm = ".".join(torchaudio.__version__.split("+")[0].split(".")[:2])
+        if torch_mm != audio_mm:
+            print(f"⚠️  Version mismatch: torch {torch.__version__} / torchaudio "
+                  f"{torchaudio.__version__}. Nên cài cùng major.minor.")
+            all_passed = False
+    except ImportError:
+        pass
     print("GPU Check:")
     gpu_ok, gpu_info = check_gpu()
     gpu_icon = "✅" if gpu_ok else "⚠️ "
@@ -164,7 +184,7 @@ def main():
         vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
         if vram_gb < 14.0:
             print(f"  ⚠️  VRAM ({vram_gb:.1f}GB) thấp hơn khuyến nghị (15GB+).")
-            print(f"      Cần giảm batch_size và tăng gradient_accumulation_steps.")
+            print("      Cần giảm batch_size và tăng gradient_accumulation_steps.")
     
     # =========================================================================
     # Kiểm tra ffmpeg

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "notes": "Thay generated_audio bằng output thật trước khi chạy; file này không chứa số liệu hoặc audio giả.",
+  "cases": [
+    {"id": "short-01", "reference_text": "Xin chào Việt Nam.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/short-01.wav", "engine": "f5tts", "seed": 42, "nfe": 32},
+    {"id": "short-02", "reference_text": "Hôm nay bạn có khỏe không?", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/short-02.wav", "engine": "f5tts", "seed": 42, "nfe": 32},
+    {"id": "number-01", "reference_text": "Hóa đơn có giá một trăm hai mươi lăm nghìn đồng.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/number-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "decimal-01", "reference_text": "Nhiệt độ trung bình là ba mươi sáu phẩy năm độ C.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/decimal-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "date-01", "reference_text": "Ngày Quốc khánh là ngày hai tháng chín năm hai nghìn không trăm hai mươi sáu.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/date-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "abbr-01", "reference_text": "Thành phố Hồ Chí Minh là một trung tâm kinh tế lớn.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/abbr-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "name-01", "reference_text": "Nguyễn Du là tác giả của Truyện Kiều.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/name-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "comma-01", "reference_text": "Buổi sáng, tôi uống cà phê, đọc sách và chuẩn bị đi học.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/comma-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "question-01", "reference_text": "Nếu trời mưa, chúng ta có nên hoãn chuyến đi không?", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/question-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "compound-01", "reference_text": "Mặc dù trời mưa rất to, các sinh viên vẫn đến lớp đúng giờ, vì hôm nay có bài kiểm tra quan trọng.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/compound-01.wav", "engine": "f5tts", "seed": 42, "nfe": 48},
+    {"id": "long-01", "reference_text": "Trí tuệ nhân tạo đang hỗ trợ con người trong giáo dục, y tế và sản xuất; tuy nhiên, chúng ta cần sử dụng công nghệ một cách minh bạch, an toàn và có trách nhiệm.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/long-01.wav", "engine": "f5tts", "seed": 42, "nfe": 64},
+    {"id": "long-02", "reference_text": "Khi hoàn thành đồ án, nhóm sẽ trình bày kiến trúc hệ thống, phương pháp chuẩn bị dữ liệu, quy trình tinh chỉnh mô hình và kết quả đánh giá định lượng bằng nhiều chỉ số khác nhau.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/evaluation_inputs/long-02.wav", "engine": "f5tts", "seed": 42, "nfe": 64}
+  ]
+}

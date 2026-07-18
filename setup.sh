@@ -19,7 +19,7 @@ set -e  # Dừng ngay nếu có lệnh nào lỗi
 # ========================== CẤU HÌNH ==========================
 ENV_NAME="vvcs"             # Tên conda environment (Vietnamese Voice Cloning Studio)
 PYTHON_VERSION="3.10"       # Python 3.10 ổn định nhất với PyTorch + F5-TTS
-CUDA_VERSION="12.1"         # Đổi thành "11.8" nếu máy bạn dùng CUDA 11.8
+CUDA_VERSION="${VVCS_CUDA_VERSION:-12.1}"  # 12.1, 11.8 hoặc cpu
 # ===============================================================
 
 echo "=============================================="
@@ -51,14 +51,13 @@ echo ""
 echo "[2/6] Thiết lập Python environment..."
 
 if command -v conda &> /dev/null; then
-    echo "    Conda detected. Tạo environment '${ENV_NAME}'..."
-    
-    # Xóa env cũ nếu tồn tại (tránh conflict)
-    conda deactivate 2>/dev/null || true
-    conda env remove -n "${ENV_NAME}" -y 2>/dev/null || true
-    
-    # Tạo env mới
-    conda create -n "${ENV_NAME}" python="${PYTHON_VERSION}" -y
+    echo "    Conda detected. Tạo hoặc dùng lại environment '${ENV_NAME}'..."
+
+    if conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
+        echo "    Environment đã tồn tại; giữ nguyên và dùng lại."
+    else
+        conda create -n "${ENV_NAME}" python="${PYTHON_VERSION}" -y
+    fi
     
     # Activate environment
     eval "$(conda shell.bash hook)"
@@ -80,7 +79,9 @@ fi
 echo ""
 echo "[3/6] Cài đặt PyTorch + torchaudio (CUDA ${CUDA_VERSION})..."
 
-if [ "${CUDA_VERSION}" = "12.1" ]; then
+if [ "${CUDA_VERSION}" = "cpu" ]; then
+    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+elif [ "${CUDA_VERSION}" = "12.1" ]; then
     # PyTorch 2.3.x với CUDA 12.1
     pip install torch==2.3.1 torchaudio==2.3.1 \
         --index-url https://download.pytorch.org/whl/cu121
@@ -90,7 +91,7 @@ elif [ "${CUDA_VERSION}" = "11.8" ]; then
         --index-url https://download.pytorch.org/whl/cu118
 else
     echo "❌ CUDA version '${CUDA_VERSION}' không được hỗ trợ."
-    echo "   Chỉ hỗ trợ: 11.8, 12.1"
+    echo "   Chỉ hỗ trợ: cpu, 11.8, 12.1"
     exit 1
 fi
 

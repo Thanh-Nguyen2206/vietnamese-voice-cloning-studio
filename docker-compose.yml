@@ -1,0 +1,18 @@
+services:
+  voice-studio:
+    build: .
+    ports:
+      - "7860:7860"
+    environment:
+      VVCS_DEVICE: cpu
+      VVCS_ENABLE_CLOUD_ENGINES: "1"
+      VVCS_MAX_CHUNK_CHARS: "280"
+    volumes:
+      - model-cache:/app/.cache/huggingface
+      - ./outputs:/app/outputs
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+    restart: unless-stopped
+
+volumes:
+  model-cache:

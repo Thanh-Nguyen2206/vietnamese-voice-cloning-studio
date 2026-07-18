@@ -22,6 +22,9 @@ model:
     ff_mult: 2           # Feed-forward multiplier
     text_dim: 512        # Text embedding dimension
     conv_layers: 4       # Số conv layers trong text encoder
+    # Hai field dưới đây BẮT BUỘC để forward pass khớp checkpoint ViVoice.
+    text_mask_padding: false
+    pe_attn_head: 1
 
 # --- Audio ---
 # Cấu hình Mel Spectrogram (PHẢI khớp với pre-trained model)
@@ -37,6 +40,7 @@ data:
   processed_dir: "data/processed"                # Thư mục chứa audio segments
   metadata_path: "data/metadata/metadata.csv"    # File CSV từ Phase 2
   num_workers: 2                                 # DataLoader workers
+  validation_split: 0.1                          # split deterministic theo seed
 
 # --- Training ---
 # ⚠️ CẤU HÌNH TỐI ƯU CHO T4 (16GB VRAM)
@@ -71,6 +75,7 @@ checkpoint:
   save_dir: "checkpoints"
   save_every_n_steps: 500          # Lưu checkpoint mỗi 500 global steps
   keep_last_n: 3                   # Chỉ giữ 3 checkpoint gần nhất (tiết kiệm disk)
+  resume: null                     # null = không resume; dùng CLI --resume latest hoặc PATH
 
 # --- Logging ---
 logging:

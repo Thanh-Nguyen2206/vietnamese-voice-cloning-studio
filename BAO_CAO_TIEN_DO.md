@@ -1,5 +1,8 @@
 # Báo cáo tiến độ — Vietnamese Voice Cloning Studio
 
+> **Tài liệu lưu trữ (snapshot 2026-06-30).** Trạng thái hiện tại, command và giới hạn đã được
+> hợp nhất/cập nhật trong `README.md`; không dùng file này làm nguồn vận hành chính.
+
 > Cập nhật: 2026-06-30
 > Đồ án DSP391m — FPTU Summer 2026
 > Thư mục dự án: `Do_An_F5TTS/vietnamese-voice-cloning-studio/`

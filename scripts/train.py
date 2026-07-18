@@ -20,32 +20,29 @@ Cách chạy:
 =============================================================================
 """
 
-import os
-import sys
-import math
-import time
 import argparse
+import json
 import logging
+import math
+import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
-import yaml
-import torch
-import torch.nn.functional as F
-import torchaudio
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-
+import torch
+import torchaudio
+import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from safetensors.torch import load_file as safetensors_load
-from huggingface_hub import hf_hub_download, list_repo_files
-from tqdm import tqdm
-
 from f5_tts.model import CFM, DiT
-from f5_tts.model.utils import get_tokenizer
-
+from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer, list_str_to_idx
+from huggingface_hub import hf_hub_download, list_repo_files
+from safetensors.torch import load_file as safetensors_load
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset, random_split
+from tqdm import tqdm
 
 # =============================================================================
 # LOGGING SETUP
@@ -74,6 +71,17 @@ def load_config(yaml_path: str) -> Dict[str, Any]:
     with open(yaml_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    required_dit = {"text_mask_padding": False, "pe_attn_head": 1}
+    dit = config.get("model", {}).get("dit", {})
+    for key, expected in required_dit.items():
+        if dit.get(key) != expected:
+            raise ValueError(
+                f"model.dit.{key} phải là {expected!r} để khớp ViVoice; "
+                "không tiếp tục vì forward pass có thể sinh giọng méo"
+            )
+    for key in ("processed_dir", "metadata_path"):
+        if "_invalid_demo_data" in Path(config["data"][key]).resolve().parts:
+            raise ValueError("Từ chối data/_invalid_demo_data: dữ liệu sóng sin giả không được train")
     logger.info(f"📋 Loaded config from: {yaml_path}")
     return config
 
@@ -161,6 +169,10 @@ class VoiceDataset(Dataset):
                 logger.warning(f"⚠️ Dòng {line_num}: file không tồn tại: {audio_path}")
                 skipped += 1
                 continue
+            if "_invalid_demo_data" in audio_path.resolve().parts:
+                raise ValueError(
+                    f"Từ chối dữ liệu cách ly _invalid_demo_data tại dòng {line_num}: {audio_path}"
+                )
 
             self.samples.append({
                 "audio_path": str(audio_path),
@@ -199,6 +211,23 @@ class VoiceDataset(Dataset):
 
         # Squeeze: [1, T] → [T]
         waveform = waveform.squeeze(0)
+
+        if not torch.isfinite(waveform).all():
+            raise ValueError(f"Audio chứa NaN/Inf: {sample['audio_path']}")
+        rms = torch.sqrt(torch.mean(waveform.float().square()))
+        if rms < 1e-4:
+            raise ValueError(f"Audio gần im lặng, từ chối train: {sample['audio_path']}")
+        clipping = torch.mean((waveform.abs() >= 0.999).float())
+        if clipping > 0.05:
+            raise ValueError(f"Audio clipping quá cao, từ chối train: {sample['audio_path']}")
+        window = waveform[: min(waveform.numel(), self.sample_rate * 10)].float()
+        if window.numel() >= 2048:
+            spectrum = torch.fft.rfft(window * torch.hann_window(window.numel())).abs().square()
+            concentration = spectrum.max() / spectrum.sum().clamp_min(1e-12)
+            if concentration > 0.45:
+                raise ValueError(
+                    f"Audio giống sóng sin/tín hiệu quá đơn giản, từ chối train: {sample['audio_path']}"
+                )
 
         return {
             "audio": waveform,           # [T_audio]
@@ -248,25 +277,12 @@ def create_collate_fn(vocab_char_map: dict, hop_length: int = 256):
 
         # --- Text tokenization ---
         texts = [item["text"] for item in batch]
-        text_token_lists = []
-
-        for text in texts:
-            # Character-level tokenization (khớp với F5-TTS pre-training)
-            tokens = []
-            for char in text.lower():
-                if char in vocab_char_map:
-                    tokens.append(vocab_char_map[char])
-                else:
-                    # Unknown char → skip (hoặc dùng UNK token)
-                    pass
-            text_token_lists.append(tokens)
-
-        # Pad text tokens
-        max_text_len = max(len(t) for t in text_token_lists) if text_token_lists else 1
-        padded_text = torch.zeros(len(batch), max_text_len, dtype=torch.long)
-        for i, tokens in enumerate(text_token_lists):
-            if tokens:
-                padded_text[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+        # PHẢI dùng cùng conversion với inference/pre-training. list_str_to_idx
+        # pad bằng -1; DiT tự +1 để filler thành 0. Pad bằng 0 sẽ thành token thật.
+        converted_texts = convert_char_to_pinyin(
+            [text.lower() for text in texts], polyphone=True
+        )
+        padded_text = list_str_to_idx(converted_texts, vocab_char_map)
 
         return {
             "audio": padded_audios,     # [B, T_max_audio]
@@ -305,6 +321,8 @@ def build_model(config: Dict[str, Any], vocab_char_map: dict) -> CFM:
         ff_mult=dit_cfg["ff_mult"],
         text_dim=dit_cfg["text_dim"],
         conv_layers=dit_cfg["conv_layers"],
+        text_mask_padding=dit_cfg["text_mask_padding"],
+        pe_attn_head=dit_cfg["pe_attn_head"],
         # PHẢI khớp mô hình gốc: chính DiT tự +1 nội bộ cho filler token, nên ở đây
         # truyền đúng len(vocab). (Bản cũ +1 thừa → text_embed lệch shape, bị bỏ khi
         # nạp lại checkpoint → fine-tune coi như mất tác dụng phần text.)
@@ -449,14 +467,37 @@ def download_and_load_weights(model: CFM, config: Dict[str, Any]) -> CFM:
         state_dict = safetensors_load(ckpt_path)
     else:
         state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        # Một số checkpoint lưu dạng {"model": state_dict, ...}
-        if isinstance(state_dict, dict) and "model" in state_dict:
+        # F5-TTS checkpoint chính thức lưu EMA với prefix ``ema_model.``.
+        if isinstance(state_dict, dict) and "ema_model_state_dict" in state_dict:
+            state_dict = {
+                key.removeprefix("ema_model."): value
+                for key, value in state_dict["ema_model_state_dict"].items()
+                if key not in {"initted", "step"}
+            }
+        elif isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        elif isinstance(state_dict, dict) and "model" in state_dict:
             state_dict = state_dict["model"]
         elif isinstance(state_dict, dict) and "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
 
-    # Load vào model (strict=False cho phép thiếu/thừa keys nhỏ)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Checkpoint {ckpt_path} không chứa state_dict hợp lệ")
+    current = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in state_dict.items()
+        if key in current and hasattr(value, "shape") and value.shape == current[key].shape
+    }
+    match_ratio = len(compatible) / max(len(current), 1)
+    if match_ratio < 0.95:
+        raise ValueError(
+            f"Checkpoint không tương thích kiến trúc: chỉ khớp {len(compatible)}/{len(current)} "
+            f"keys ({match_ratio:.1%}); từ chối train để tránh khởi tạo gần-random"
+        )
+
+    # Chấp nhận buffer thừa/thiếu nhỏ do khác phiên bản mel frontend.
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
 
     if missing:
         logger.warning(f"⚠️ Missing keys ({len(missing)}): {missing[:5]}...")
@@ -465,7 +506,7 @@ def download_and_load_weights(model: CFM, config: Dict[str, Any]) -> CFM:
     if not missing and not unexpected:
         logger.info("   Tất cả keys khớp hoàn hảo!")
 
-    logger.info("✅ Pre-trained weights loaded thành công!")
+    logger.info(f"✅ Pre-trained weights loaded: {len(compatible)}/{len(current)} keys")
     return model
 
 
@@ -581,6 +622,7 @@ def save_checkpoint(
     loss: float,
     save_dir: str,
     keep_last_n: int = 3,
+    metadata: Optional[Dict[str, Any]] = None,
 ):
     """
     Lưu checkpoint training.
@@ -627,6 +669,11 @@ def save_checkpoint(
         "epoch": epoch,
         "loss": loss,
     }, ckpt_dir / "training_state.pt")
+    if metadata:
+        (ckpt_dir / "checkpoint_metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
 
     logger.info(f"💾 Checkpoint saved: {ckpt_dir}")
 
@@ -643,6 +690,7 @@ def load_checkpoint(
     model: CFM,
     optimizer: AdamW,
     checkpoint_dir: str,
+    expected_base_model: str,
 ) -> int:
     """
     Load checkpoint gần nhất để resume training.
@@ -659,12 +707,27 @@ def load_checkpoint(
     if not ckpt_path.exists():
         return 0
 
-    all_ckpts = sorted(ckpt_path.glob("step_*"))
-    if not all_ckpts:
-        return 0
-
-    latest_ckpt = all_ckpts[-1]
+    if ckpt_path.name.startswith("step_"):
+        latest_ckpt = ckpt_path
+    else:
+        all_ckpts = sorted(ckpt_path.glob("step_*"))
+        if not all_ckpts:
+            return 0
+        latest_ckpt = all_ckpts[-1]
     logger.info(f"📂 Resume từ checkpoint: {latest_ckpt.name}")
+
+    meta_path = latest_ckpt / "checkpoint_metadata.json"
+    if not meta_path.is_file():
+        raise ValueError(
+            f"Checkpoint {latest_ckpt} thiếu checkpoint_metadata.json; từ chối resume "
+            "checkpoint cũ/không xác minh được"
+        )
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    if metadata.get("base_model") != expected_base_model:
+        raise ValueError(
+            f"Checkpoint base model {metadata.get('base_model')!r} không khớp "
+            f"{expected_base_model!r}"
+        )
 
     # Load model weights
     model_state = torch.load(latest_ckpt / "model.pt", map_location="cpu")
@@ -685,7 +748,16 @@ def load_checkpoint(
 # =============================================================================
 # 6. TRAINING LOOP (CỐT LÕI)
 # =============================================================================
-def train(config: Dict[str, Any]):
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def train(config: Dict[str, Any], resume: str | None = None):
     """
     Main training function.
 
@@ -711,8 +783,12 @@ def train(config: Dict[str, Any]):
     #   - Gradient Accumulation: gom gradient qua N mini-batches
     #   - Device placement: tự động đưa tensor lên GPU
     # -----------------------------------------------------------------
+    requested_precision = train_cfg["mixed_precision"]
+    if requested_precision in {"fp16", "bf16"} and not torch.cuda.is_available():
+        logger.warning("⚠️ Không có CUDA; tắt mixed precision và dùng CPU (rất chậm).")
+        requested_precision = "no"
     accelerator = Accelerator(
-        mixed_precision=train_cfg["mixed_precision"],  # "fp16"
+        mixed_precision=requested_precision,
         gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
     )
     set_seed(train_cfg["seed"])
@@ -721,7 +797,7 @@ def train(config: Dict[str, Any]):
     logger.info(" Vietnamese Voice Cloning Studio — Fine-tuning")
     logger.info("=" * 60)
     logger.info(f"  Device          : {accelerator.device}")
-    logger.info(f"  Mixed Precision : {train_cfg['mixed_precision']}")
+    logger.info(f"  Mixed Precision : {requested_precision}")
     logger.info(f"  Batch Size      : {train_cfg['batch_size']}")
     logger.info(f"  Grad Accum Steps: {train_cfg['gradient_accumulation_steps']}")
     logger.info(f"  Effective Batch : {train_cfg['batch_size'] * train_cfg['gradient_accumulation_steps']}")
@@ -750,8 +826,20 @@ def train(config: Dict[str, Any]):
         vocab_char_map,
         hop_length=config["audio"]["hop_length"],  # Phải khớp với model mel_spec
     )
+    validation_split = float(data_cfg.get("validation_split", 0.1))
+    if not 0 <= validation_split < 1:
+        raise ValueError("data.validation_split phải nằm trong [0, 1)")
+    val_size = max(1, round(len(dataset) * validation_split)) if len(dataset) >= 2 and validation_split else 0
+    train_size = len(dataset) - val_size
+    if val_size:
+        train_dataset, val_dataset = random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(train_cfg["seed"]),
+        )
+    else:
+        train_dataset, val_dataset = dataset, None
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=train_cfg["batch_size"],
         shuffle=True,
         num_workers=data_cfg.get("num_workers", 2),
@@ -759,6 +847,11 @@ def train(config: Dict[str, Any]):
         pin_memory=True,
         drop_last=False,
     )
+    val_dataloader = (DataLoader(
+        val_dataset, batch_size=train_cfg["batch_size"], shuffle=False,
+        num_workers=data_cfg.get("num_workers", 2), collate_fn=collate_fn,
+        pin_memory=True, drop_last=False,
+    ) if val_dataset is not None else None)
 
     # -----------------------------------------------------------------
     # Bước 4: Optimizer (AdamW)
@@ -780,17 +873,43 @@ def train(config: Dict[str, Any]):
     #   - Wrap optimizer với GradScaler
     #   - Wrap dataloader với device placement
     # -----------------------------------------------------------------
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    if val_dataloader is not None:
+        model, optimizer, dataloader, val_dataloader = accelerator.prepare(
+            model, optimizer, dataloader, val_dataloader
+        )
+    else:
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     # -----------------------------------------------------------------
-    # Resume từ checkpoint (nếu có)
+    # Resume chỉ khi người dùng yêu cầu rõ; không tự nạp checkpoint cũ.
     # -----------------------------------------------------------------
     resume_step = 0
     raw_model = accelerator.unwrap_model(model)
-    if Path(ckpt_cfg["save_dir"]).exists():
-        resume_step = load_checkpoint(raw_model, optimizer, ckpt_cfg["save_dir"])
+    resume_target = resume or ckpt_cfg.get("resume")
+    if resume_target:
+        target = ckpt_cfg["save_dir"] if resume_target == "latest" else resume_target
+        resume_step = load_checkpoint(raw_model, optimizer, target, config["model"]["repo_id"])
         if resume_step > 0:
             logger.info(f"🔄 Resumed training from step {resume_step}")
+
+    save_root = Path(ckpt_cfg["save_dir"])
+    save_root.mkdir(parents=True, exist_ok=True)
+    (save_root / "config_snapshot.yaml").write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    dataset_summary = {
+        "samples": len(dataset), "train_samples": train_size, "validation_samples": val_size,
+        "metadata_path": str(Path(data_cfg["metadata_path"]).resolve()),
+        "processed_dir": str(Path(data_cfg["processed_dir"]).resolve()),
+    }
+    checkpoint_metadata = {
+        "base_model": config["model"]["repo_id"],
+        "architecture": config["model"]["dit"],
+        "training_config": train_cfg,
+        "vocab_size": len(vocab_char_map),
+        "git_commit": _git_commit(),
+        "dataset_summary": dataset_summary,
+    }
 
     # -----------------------------------------------------------------
     # Tính tổng số steps
@@ -876,6 +995,11 @@ def train(config: Dict[str, Any]):
                     lens=batch["lens"],   # [B]          — actual mel lengths
                 )
 
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Loss NaN/Inf tại step {global_step}; dừng để bảo vệ checkpoint"
+                    )
+
                 # BACKWARD PASS
                 # accelerator.backward() tự động:
                 #   - Scale loss (FP16 GradScaler)
@@ -953,6 +1077,8 @@ def train(config: Dict[str, Any]):
                     loss=loss_val,
                     save_dir=ckpt_cfg["save_dir"],
                     keep_last_n=ckpt_cfg["keep_last_n"],
+                    metadata={**checkpoint_metadata, "global_step": global_step,
+                              "epoch": epoch, "validation_loss": None},
                 )
 
         # =========================================================
@@ -968,10 +1094,38 @@ def train(config: Dict[str, Any]):
         if tb_writer:
             tb_writer.add_scalar("train/epoch_loss", avg_epoch_loss, epoch + 1)
 
-        # Track best loss
-        if avg_epoch_loss < best_loss:
-            best_loss = avg_epoch_loss
-            logger.info(f"   🏆 New best loss: {best_loss:.4f}")
+        validation_loss = None
+        if val_dataloader is not None:
+            model.eval()
+            validation_values = []
+            with torch.no_grad():
+                for val_batch in val_dataloader:
+                    val_loss, _, _ = model(
+                        inp=val_batch["audio"], text=val_batch["text"], lens=val_batch["lens"]
+                    )
+                    if not torch.isfinite(val_loss):
+                        raise FloatingPointError("Validation loss NaN/Inf")
+                    validation_values.append(float(accelerator.gather(val_loss.detach()).mean().item()))
+            model.train()
+            validation_loss = float(np.mean(validation_values))
+            logger.info(f"   Validation loss: {validation_loss:.4f}")
+            if tb_writer:
+                tb_writer.add_scalar("validation/loss", validation_loss, epoch + 1)
+
+        selection_loss = validation_loss if validation_loss is not None else avg_epoch_loss
+        if selection_loss < best_loss:
+            best_loss = selection_loss
+            logger.info(f"   🏆 New best selection loss: {best_loss:.4f}")
+            if accelerator.is_main_process:
+                best_dir = save_root / "best"
+                best_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(accelerator.unwrap_model(model).state_dict(), best_dir / "model.pt")
+                (best_dir / "checkpoint_metadata.json").write_text(
+                    json.dumps({**checkpoint_metadata, "global_step": global_step,
+                                "epoch": epoch, "validation_loss": validation_loss},
+                               ensure_ascii=False, indent=2, default=str) + "\n",
+                    encoding="utf-8",
+                )
 
     # =================================================================
     # TRAINING COMPLETE
@@ -997,6 +1151,8 @@ def train(config: Dict[str, Any]):
         loss=best_loss,
         save_dir=ckpt_cfg["save_dir"],
         keep_last_n=ckpt_cfg["keep_last_n"] + 1,  # +1 giữ thêm final checkpoint
+        metadata={**checkpoint_metadata, "global_step": global_step,
+                  "epoch": train_cfg["epochs"], "validation_loss": best_loss},
     )
 
     if tb_writer:
@@ -1004,7 +1160,7 @@ def train(config: Dict[str, Any]):
 
     logger.info(f"\n  Checkpoints: {ckpt_cfg['save_dir']}/")
     logger.info(f"  TensorBoard: tensorboard --logdir {log_cfg['log_dir']}")
-    logger.info(f"\n  Tiếp theo → Phase 4: Inference & Evaluation")
+    logger.info("\n  Tiếp theo → Phase 4: Inference & Evaluation")
     logger.info("=" * 60)
 
 
@@ -1019,14 +1175,18 @@ def main():
 Cách chạy:
   python scripts/train.py --config configs/train_config.yaml
 
-Resume training (tự động detect checkpoint):
-  python scripts/train.py --config configs/train_config.yaml
+Resume training (phải yêu cầu rõ):
+  python scripts/train.py --config configs/train_config.yaml --resume latest
         """
     )
 
     parser.add_argument(
         "--config", type=str, required=True,
         help="Đường dẫn file config YAML (configs/train_config.yaml)"
+    )
+    parser.add_argument(
+        "--resume", nargs="?", const="latest", default=None,
+        help="Resume rõ ràng từ checkpoint mới nhất hoặc một thư mục step_XXXXXXX",
     )
 
     args = parser.parse_args()
@@ -1036,7 +1196,7 @@ Resume training (tự động detect checkpoint):
         sys.exit(1)
 
     config = load_config(args.config)
-    train(config)
+    train(config, resume=args.resume)
 
 
 if __name__ == "__main__":

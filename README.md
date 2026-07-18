@@ -1,165 +1,212 @@
-# 🎙️ Vietnamese Voice Cloning Studio
+# Vietnamese Voice Cloning Studio
 
-Nhân bản giọng nói tiếng Việt từ một đoạn audio mẫu — kèm giao diện **so sánh
-nhiều mô hình** cạnh nhau. (Đồ án DSP391m — FPTU Summer 2026.)
+Đồ án DSP391m tại FPT University: web app song ngữ để nhân bản giọng nói tiếng Việt bằng
+F5-TTS và so sánh cùng input với XTTS-v2, MMS-TTS, Piper, Edge-TTS và Bark.
 
-> Mô hình nền: bản tiếng Việt 1000 giờ trên HuggingFace · Vocoder: Vocos.
+> Model nền `hynt/F5-TTS-Vietnamese-ViVoice` dùng giấy phép
+> **CC-BY-NC-SA-4.0**. Repository này chỉ dành cho nghiên cứu/giáo dục phi thương mại.
+> Chỉ sử dụng giọng của chính bạn hoặc giọng mà bạn có quyền và sự đồng ý để sử dụng.
 
-## Có gì trong bản này
+## Trạng thái có thể kiểm chứng
 
-- **Giao diện web** (`app.py`): tải audio mẫu → nhập văn bản → nghe kết quả.
-  Chọn một hoặc nhiều mô hình để **so sánh** bằng tai và bằng **số liệu khách quan**.
-- **So sánh không cần web** (`scripts/compare_models.py`): sinh audio cho nhiều
-  mô hình, xuất báo cáo Markdown kèm chỉ số chất lượng.
-- **Pipeline huấn luyện** (`scripts/data_prep.py`, `scripts/train.py`) để fine-tune
-  trên giọng của riêng bạn.
+- Inference F5-TTS giữ utility chính thức, gồm preprocessing/tokenization của thư viện.
+- DiT giữ bắt buộc `text_mask_padding=False` và `pe_attn_head=1` ở cả inference/training.
+- Có chunking câu dài, evaluation WER/CER/speaker similarity, data validation và unit tests offline.
+- Pipeline fine-tune đã được gia cố nhưng **chưa được xác minh end-to-end bằng dữ liệu người thật/GPU**.
+- Không có kết quả WER/CER/SECS mẫu trong repo; phải sinh audio thật rồi chạy evaluation.
 
-## Sáu engine để so sánh
+Tài liệu chi tiết: [kiến trúc](docs/ARCHITECTURE.md), [fine-tuning](docs/FINETUNING.md),
+[evaluation](docs/EVALUATION.md), [deployment](docs/DEPLOYMENT.md),
+[kịch bản demo](docs/DEMO_GUIDE.md), [dependency/model licenses](docs/LICENSES.md).
 
-Site so sánh trực tiếp **cả 6 mô hình cùng lúc** trên cùng đầu vào — kết quả của
-từng mô hình **hiện ngay khi tạo xong** (engine nhanh chạy trước, không phải chờ
-toàn bộ)
-(`engines.py` chứa 5 engine bổ sung, nạp lười — lần đầu chọn sẽ tải mô hình).
-Giao diện **song ngữ Việt/Anh** (nút chuyển ở góc trên bên phải).
+## Kiến trúc và engine
 
-| Engine | Nguồn | Nhân bản giọng? | Tiếng Việt | Ghi chú |
-|---|---|---|---|---|
-| **F5-TTS** (gốc) | `hynt/...ViVoice` | Có | Rất tốt | Chất lượng tốt nhất. Không đổi. |
-| **XTTS-v2 (viXTTS)** | `capleaf/viXTTS` | Có | Tốt | **Rất nhạy với audio mẫu** — cần mẫu SẠCH, không nhạc nền. |
-| **MMS-TTS (Meta)** | `facebook/mms-tts-vie` | Không (1 giọng) | Khá | VITS gọn nhẹ, local, rất nhanh. |
-| **Piper (Rhasspy)** | `rhasspy/piper` (vi_VN-vais1000) | Không (1 giọng) | Khá | ONNX, **nhanh nhất trên CPU**, tất định. |
-| **Edge-TTS (Microsoft)** | `rany2/edge-tts` (vi-VN-HoaiMy) | Không (1 giọng) | Rất tốt | Baseline thương mại — **chạy cloud, cần internet**; timeout 40s, mỗi engine khoá riêng nên không chặn nhau. |
-| **Bark (Suno)** | `suno/bark-small` | Không (preset) | Hạn chế | **Chậm trên CPU** (~100s/câu), để đối chiếu. |
+```text
+Gradio UI / compare_models.py
+        │
+        ├── F5-TTS ViVoice ── reference audio + transcript ── voice cloning
+        ├── XTTS-v2 ───────── reference audio ─────────────── voice cloning
+        ├── MMS / Piper / Bark ────────────────────────────── fixed/preset local TTS
+        └── Edge-TTS ──────────────────────────────────────── cloud TTS
 
-> Site kèm sẵn **audio mẫu sạch** (`reference_audio/sample_clean_vi.wav`) làm mặc định
-> để mọi engine chạy tốt ngay. XTTS đặc biệt cần mẫu sạch (mẫu có nhạc nền dễ khiến
-> XTTS đọc sai từ — F5-TTS thì bền hơn). Mỗi kết quả hiển thị RMS, độ phẳng phổ và
-> **thời gian tạo** để so sánh khách quan cả chất lượng lẫn tốc độ.
->
-> Các checkpoint fine-tune demo (huấn luyện trên dữ liệu giả) **không hiển thị** trên
-> site; bật lại để nghiên cứu bằng biến môi trường `VVCS_SHOW_DEMO_CKPTS=1`.
+generated WAV ── evaluate.py ── Whisper WER/CER + Resemblyzer similarity + audio metrics
+```
 
-## ⚡ Lưu ý quan trọng về "nhiễu tĩnh" (đã sửa)
+| Engine | Loại | Voice cloning | Nơi chạy | Ghi chú |
+|---|---|---:|---|---|
+| F5-TTS ViVoice | local/offline sau khi cache | Có | CPU/CUDA, MPS thử nghiệm | Engine chính, 24 kHz |
+| viXTTS | local/offline sau khi cache | Có | CPU/CUDA | Cần reference sạch |
+| MMS-TTS | local | Không | CPU/CUDA | Một giọng tiếng Việt |
+| Piper | local | Không | CPU | ONNX, nhanh |
+| Edge-TTS | cloud | Không | Internet | Timeout có kiểm soát |
+| Bark | local | Không | CPU/CUDA | Rất chậm trên CPU, tiếng Việt hạn chế |
 
-Bản trước cho ra **nhiễu tĩnh / gần như im lặng** thay vì giọng người vì hai lý do:
+Voice cloning học đặc trưng giọng từ reference. TTS thông thường dùng giọng cố định. “Cloud”
+gửi text tới dịch vụ bên ngoài; “offline” không cần mạng sau khi model đã được cache.
 
-1. **Checkpoint hỏng.** Các file `checkpoints/step_*/model.pt` được fine-tune trên
-   dữ liệu **giả** (`segment_*.wav` thực chất là **sóng sin**, không phải tiếng nói —
-   xem `data/_invalid_demo_data/`). App cũ tự động đè checkpoint này lên mô hình gốc
-   → làm hỏng đầu ra.
-2. **Tự viết lại pipeline suy luận** và bỏ qua bước token hoá (`convert_char_to_pinyin`)
-   mà mô hình đã được huấn luyện cùng → giọng méo ngay cả với mô hình gốc.
+## Quick start
 
-Bản hiện tại dùng **đúng pipeline suy luận chính thức** và **mặc định mô hình gốc**
-(cho ra giọng người sạch). Các checkpoint cũ vẫn được giữ và liệt kê trong giao diện
-so sánh để bạn tự nghe thấy chúng kém hơn.
-
-## File lớn không có trong repo GitHub
-
-Repo này **không chứa model weights** (`checkpoints/`, `optimizer_states/` — tổng ~7.5GB).
-Lý do: hai checkpoint fine-tune đó được huấn luyện trên dữ liệu **giả** (sóng sin, xem
-`data/_invalid_demo_data/README.md`) nên chỉ tạo ra nhiễu, không có giá trị dùng lại —
-và `optimizer_states/` chỉ cần cho việc *tiếp tục* huấn luyện, không cần để chạy app.
-
-Bạn **không cần tải gì thêm** để chạy app: mô hình gốc (`hynt/F5-TTS-Vietnamese-ViVoice`)
-và tất cả engine khác đều **tự động tải từ HuggingFace Hub** trong lần chạy đầu tiên
-(`python app.py`), và được cache lại cho các lần sau.
-
-Nếu bạn tự fine-tune (mục *Fine-tune trên giọng của bạn* bên dưới) trên **dữ liệu giọng
-người thật**, checkpoint mới sẽ lưu vào `checkpoints/` — thư mục này đã có trong
-`.gitignore` nên sẽ không vô tình bị commit lên GitHub.
-
-## Cài đặt
+Yêu cầu: Python 3.10/3.11, ffmpeg và đủ dung lượng để cache model.
 
 ```bash
-bash setup.sh            # có GPU (Colab/Kaggle/RunPod)
-# hoặc:
+python -m venv .venv
+source .venv/bin/activate                 # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-python verify_env.py     # kiểm tra môi trường
+python verify_env.py
+python app.py                             # http://localhost:7860
 ```
 
-## Chạy giao diện web
+CPU là fallback an toàn nhưng Bark/training rất chậm. NVIDIA CUDA phù hợp cho inference/training:
 
 ```bash
-python app.py                 # http://localhost:7860
-python app.py --share         # link public (Colab/Kaggle)
-python app.py --port 8080     # đổi port
+VVCS_DEVICE=cuda python app.py
+VVCS_DEVICE=mps python app.py             # macOS Apple Silicon: thử nghiệm
+VVCS_OFFLINE=1 python app.py              # chỉ dùng cache local, Edge bị chặn
 ```
 
-Mặc định mô hình chạy trên CPU cho ổn định. Muốn nhanh hơn trên máy có GPU:
+Linux là môi trường deploy được khuyến nghị. macOS chạy CPU/MPS nhưng không có CUDA. Windows cần
+ffmpeg trong `PATH`; Piper/Coqui có thể phụ thuộc wheel theo phiên bản Python.
+
+### Cấu hình môi trường
+
+Các biến chính: `VVCS_DEVICE`, `VVCS_MODEL_ID`, `VVCS_CACHE_DIR`, `VVCS_OUTPUT_DIR`,
+`VVCS_NFE`, `VVCS_SEED`, `VVCS_MAX_TEXT_CHARS`, `VVCS_MAX_CHUNK_CHARS`,
+`VVCS_CHUNK_SILENCE_MS`, `VVCS_ENGINE_TIMEOUT`, `VVCS_WHISPER_MODEL`, `VVCS_OFFLINE`,
+`VVCS_ENABLE_CLOUD_ENGINES`.
+
+## Sử dụng app
+
+1. Upload reference sạch 3–10 giây và nhập transcript chính xác.
+2. Xác nhận bạn có quyền/sự đồng ý sử dụng giọng.
+3. Nhập text, chọn engine, NFE 32/48/64 và `auto` chunking cho câu dài.
+4. Chạy. Một engine lỗi không ngăn engine kế tiếp; card giữ thứ tự người dùng chọn.
+
+Audio tham chiếu nên một người nói, không nhạc/echo, không clipping. App giới hạn tổng text mặc
+định 10.000 ký tự; khi tắt chunking, giới hạn trực tiếp là 2.000 ký tự.
+
+## Data preparation và metadata
+
+Đặt audio người thật vào `data/raw/`. Tuyệt đối không dùng `data/_invalid_demo_data/`.
 
 ```bash
-VVCS_DEVICE=cuda python app.py     # hoặc VVCS_DEVICE=mps (thử nghiệm)
-```
-
-### Cách dùng
-
-1. **Tải audio mẫu** (3–10 giây) — giọng muốn nhân bản.
-2. **Nhập transcript** của audio mẫu (để trống → Whisper tự nhận diện).
-3. **Nhập văn bản** cần đọc.
-4. **Chọn mô hình** để so sánh (mặc định: mô hình gốc).
-5. Bấm **Tạo & so sánh giọng nói**. Mỗi kết quả kèm nhận định chất lượng
-   (RMS, độ phẳng phổ) để đối chiếu khách quan.
-
-## So sánh mô hình bằng dòng lệnh
-
-```bash
-python scripts/compare_models.py --ref reference_audio/audio.wav
-# chỉ định mô hình & câu:
-python scripts/compare_models.py --ref ref.wav \
-    --models base xtts piper --nfe 32
-```
-
-Kết quả: `outputs/comparison/*.wav` + `outputs/comparison/report.md`.
-
----
-
-## Fine-tune trên giọng của bạn
-
-> ⚠️ Cần **giọng người thật** (30–60 phút, 24kHz mono). Dữ liệu sin/tổng hợp sẽ cho
-> ra mô hình nhiễu (xem `data/_invalid_demo_data/`).
-
-```bash
-# 1) Tiền xử lý
 python scripts/data_prep.py \
-    --input_dir data/raw --output_dir data/processed \
-    --sample_rate 24000 --min_duration 3.0 --max_duration 10.0
-# 2) Điền transcript vào cột "text" của data/metadata/metadata.csv
-# 3) Fine-tune
+  --input_dir data/raw --output_dir data/processed \
+  --sample_rate 24000 --min_duration 3 --max_duration 10
+```
+
+Schema chính thức là pipe-delimited UTF-8:
+
+```text
+audio_file|duration_sec|snr_db|source_file|text
+segment_00001.wav|5.20|34.1|recording.wav|Transcript chính xác ở đây.
+```
+
+Sau khi điền transcript:
+
+```bash
+python scripts/data_prep.py validate \
+  --metadata data/metadata/metadata.csv \
+  --processed-dir data/processed \
+  --report outputs/dataset_summary.json
+```
+
+Validator báo duration/sample-rate/transcript distribution, duplicate, missing/invalid row và
+deterministic train/validation count; nó chặn silence, NaN/Inf, clipping quá cao và tín hiệu giống sin.
+
+## Fine-tuning
+
+Chỉ chạy với dữ liệu người thật đã validate. Cần GPU CUDA thực tế; CPU fallback tồn tại để kiểm tra
+code path nhưng không phù hợp huấn luyện đầy đủ.
+
+```bash
 python scripts/train.py --config configs/train_config.yaml
+python scripts/train.py --config configs/train_config.yaml --resume latest
+python scripts/train.py --config configs/train_config.yaml --resume checkpoints/step_0001000
+tensorboard --logdir logs
 ```
 
-Checkpoint lưu vào `checkpoints/step_XXXXXXX/model.pt`; tự động xuất hiện trong
-danh sách so sánh của app ở lần khởi động sau.
+Không auto-resume. Checkpoint resume phải có metadata và đúng base model. Training lưu config snapshot,
+dataset summary, git commit, validation loss, periodic checkpoint và `checkpoints/best/model.pt`.
+Xem [docs/FINETUNING.md](docs/FINETUNING.md) và notebook Colab.
 
----
+## Evaluation và benchmark NFE
 
-## Cấu trúc thư mục
+Copy manifest mẫu, thay đường dẫn bằng audio sinh thật và thêm `inference_time` nếu có:
 
-```
-vietnamese-voice-cloning-studio/
-├── app.py                     ← Giao diện web (CHẠY FILE NÀY)
-├── requirements.txt
-├── setup.sh                   ← Cài đặt môi trường
-├── verify_env.py              ← Kiểm tra môi trường
-├── configs/train_config.yaml  ← Config fine-tune
-├── scripts/
-│   ├── data_prep.py           ← Tiền xử lý audio
-│   ├── train.py               ← Fine-tuning
-│   └── compare_models.py      ← So sánh mô hình (CLI)
-├── data/
-│   ├── raw/                   ← Audio gốc của bạn
-│   ├── processed/             ← Audio đã xử lý
-│   ├── metadata/              ← metadata.csv
-│   └── _invalid_demo_data/    ← Dữ liệu giả (KHÔNG dùng để train)
-├── checkpoints/step_*/model.pt ← Checkpoint fine-tune (dữ liệu demo)
-├── outputs/                   ← Audio sinh ra + báo cáo so sánh
-└── logs/                      ← TensorBoard logs
+```bash
+cp evaluation/test_cases.example.json evaluation/test_cases.json
+python scripts/evaluate.py \
+  --manifest evaluation/test_cases.json \
+  --output-dir outputs/evaluation --device auto
 ```
 
-## Chi tiết kỹ thuật
+Output: `results.json`, `results.csv`, `report.md`. Batch giữ partial failure; nếu mọi mẫu lỗi, exit code
+là 1. Speaker similarity chỉ là metric tương đối, không phải nhận dạng sinh trắc học.
 
-- Kiến trúc nền: DiT (dim=1024, depth=22, heads=16) ~336M tham số, mô hình tiếng
-  Việt 1000h `hynt/F5-TTS-Vietnamese-ViVoice`.
-- Vocoder: Vocos (24kHz).
-- Giấy phép mô hình nền: CC-BY-NC-SA-4.0 (chỉ dùng cho nghiên cứu phi thương mại).
+Benchmark cùng seed/text cho từng NFE rồi evaluate từng manifest:
+
+```bash
+for nfe in 32 48 64; do
+  python scripts/compare_models.py --ref reference_audio/sample_clean_vi.wav \
+    --models base --nfe "$nfe" --seed 42 --out-dir "outputs/nfe_${nfe}"
+done
+```
+
+Không kết luận NFE nào tốt nhất nếu chưa có report trên cùng bộ câu.
+
+## Testing và CI
+
+Unit tests không tải model hoặc gọi cloud:
+
+```bash
+pip install -r requirements-dev.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q   # biến này tránh plugin global hỏng trong một số Conda env
+ruff check voice_studio tests scripts/evaluate.py
+python -m compileall -q .
+```
+
+Heavy tests phải opt-in bằng marker `integration` hoặc `gpu`. GitHub Actions chỉ compile, lint và unit test.
+
+## Docker và Hugging Face Spaces
+
+```bash
+docker compose build
+docker compose up
+```
+
+Model cache, outputs, data và checkpoints là volume; image không bake dữ liệu/weights người dùng.
+Hướng dẫn Spaces, resource limit, cold start và secrets nằm tại [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+## Troubleshooting và giới hạn
+
+- `verify_env.py` báo thiếu package: cài lại `requirements.txt` trong đúng virtualenv.
+- Edge lỗi/timeout: kiểm tra Internet hoặc bỏ engine này; dùng `VVCS_OFFLINE=1` khi cần riêng tư.
+- CUDA OOM: chỉ chọn một engine, giảm độ dài chunk, restart app; Bark/XTTS dùng nhiều RAM/VRAM.
+- Transcript reference sai hoặc audio bẩn làm giảm chất lượng cloning.
+- WER phụ thuộc chất lượng Whisper; similarity phụ thuộc Resemblyzer và chỉ dùng để so sánh tương đối.
+- Chưa có dữ liệu thật/checkpoint được kiểm chứng trong repo; fine-tuning/GPU/integration chưa được tuyên bố pass.
+- Base model phi thương mại. Muốn thương mại phải thay model hoặc có giấy phép phù hợp và review license
+  của F5-TTS, engine/checkpoint/dataset liên quan.
+
+## Project structure
+
+```text
+app.py                    Gradio + orchestration
+engines.py                optional engines, lazy loading, error mapping
+voice_studio/             config, text/audio/evaluation logic thuần
+scripts/data_prep.py      preprocess + metadata validation
+scripts/train.py          fine-tuning
+scripts/compare_models.py comparison CLI
+scripts/evaluate.py       objective evaluation CLI
+evaluation/               example manifest
+tests/                    offline unit tests
+docs/                     architecture/evaluation/fine-tuning/deploy/demo
+Dockerfile                CPU demo image
+```
+
+## License và ethical use
+
+Repository hiện chưa khai báo license riêng cho phần code dự án; model/checkpoint/dataset/dependency vẫn giữ
+license riêng. Base ViVoice là CC-BY-NC-SA-4.0. Không dùng để mạo danh, lừa đảo,
+né xác thực hoặc tạo nội dung không có sự đồng ý. Khi chia sẻ output, nên ghi rõ đó là audio tổng hợp.

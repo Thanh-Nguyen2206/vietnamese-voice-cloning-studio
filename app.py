@@ -16,36 +16,39 @@ văn bản, và mô hình sẽ đọc văn bản đó bằng giọng của audio
 Chạy:  python app.py            # mở http://localhost:7860
        python app.py --share    # tạo link public (Colab/Kaggle)
 """
-import os
-import re
-import sys
-import time
-import html as html_mod
-import random
 import argparse
+import html as html_mod
+import json
+import random
+import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
-import numpy as np
-import torch
-import soundfile as sf
 import gradio as gr
+import numpy as np
+import soundfile as sf
+import torch
 from huggingface_hub import hf_hub_download
+
+from voice_studio.audio_utils import concatenate_audio, peak_normalize
+from voice_studio.config import load_config
+from voice_studio.text_processing import normalize_vietnamese, split_long_text
 
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 APP_TITLE = "Vietnamese Voice Cloning Studio"
+CONFIG = load_config(ROOT)
 
 # ─── Thiết bị tính toán ─────────────────────────────────────────────────────────
 # Mô hình mặc định chạy trên CPU vì cho kết quả ổn định & đã được kiểm chứng cho ra
 # giọng sạch. Có thể ép sang GPU/MPS qua biến môi trường VVCS_DEVICE nếu muốn nhanh
 # hơn (cuda thường an toàn; mps có thể sai số học với một số phép toán của DiT).
 def _auto_device() -> str:
-    env = os.environ.get("VVCS_DEVICE", "").strip().lower()
-    if env:
-        return env
+    if CONFIG.device != "auto":
+        return CONFIG.device
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
@@ -53,12 +56,12 @@ def _auto_device() -> str:
 DEVICE = _auto_device()
 
 # ─── Thông tin mô hình nền ──────────────────────────────────────────────────────
-REPO_ID        = "hynt/F5-TTS-Vietnamese-ViVoice"   # mô hình tiếng Việt 1000h
+REPO_ID        = CONFIG.model_id                       # mô hình tiếng Việt 1000h
 VOCAB_FILENAME = "config.json"                       # repo lưu vocab dưới tên này
 CKPT_FILENAME  = "model_last.pt"
 CHECKPOINT_DIR = ROOT / "checkpoints"
-OUTPUT_DIR     = ROOT / "outputs"
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR     = CONFIG.output_dir
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Kiến trúc DiT của F5TTS_Base (PHẢI khớp mô hình gốc — không sửa).
 # QUAN TRỌNG: phải đủ CẢ `text_mask_padding=False` và `pe_attn_head=1`. Thiếu hai
@@ -68,6 +71,7 @@ def _load_arch():
     """Lấy nguyên cấu hình arch F5TTS_Base từ thư viện để khớp 100% mô hình gốc."""
     try:
         from importlib.resources import files
+
         from omegaconf import OmegaConf
         cfg = OmegaConf.load(str(files("f5_tts").joinpath("configs/F5TTS_Base.yaml")))
         return OmegaConf.to_container(cfg.model.arch, resolve=True)
@@ -79,19 +83,31 @@ def _load_arch():
         )
 
 DIT_CFG = _load_arch()
-TARGET_SR = 24000
+TARGET_SR = CONFIG.sample_rate
 
 # Tham số suy luận mặc định
-DEFAULT_NFE  = 32
+DEFAULT_NFE  = CONFIG.nfe
 CFG_STRENGTH = 2.0
 SWAY_COEF    = -1.0
-DEFAULT_SEED = 42          # cố định để kết quả tái lập & so sánh công bằng
-MAX_GEN_CHARS = 2000       # chặn văn bản quá dài (tránh treo trên CPU)
+DEFAULT_SEED = CONFIG.seed
+MAX_GEN_CHARS = CONFIG.max_text_chars
+DIRECT_TEXT_LIMIT = 2000
 
 # ─── Đăng ký mô hình để so sánh ─────────────────────────────────────────────────
 def _discover_finetuned():
     found = []
     for ck in sorted(CHECKPOINT_DIR.glob("step_*/model.pt")):
+        metadata_path = ck.parent / "checkpoint_metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            arch = metadata.get("architecture", {})
+            if metadata.get("base_model") != REPO_ID:
+                raise ValueError("base model không khớp")
+            if arch.get("text_mask_padding") is not False or arch.get("pe_attn_head") != 1:
+                raise ValueError("metadata DiT thiếu compatibility fields")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[VVCS] Bỏ checkpoint không xác minh được {ck.parent.name}: {exc}")
+            continue
         step = ck.parent.name.replace("step_", "").lstrip("0") or "0"
         found.append((f"ft_{ck.parent.name}", f"step {step}", ck))
     return found
@@ -162,9 +178,13 @@ def _ensure_assets():
     """Tải vocab + checkpoint gốc + vocoder (một lần). Có dự phòng CPU cho vocoder."""
     global _vocab_file, _base_ckpt, _vocoder, DEVICE
     if _vocab_file is None:
-        _vocab_file = hf_hub_download(repo_id=REPO_ID, filename=VOCAB_FILENAME)
+        _vocab_file = hf_hub_download(repo_id=REPO_ID, filename=VOCAB_FILENAME,
+                                      cache_dir=CONFIG.cache_dir,
+                                      local_files_only=CONFIG.offline)
     if _base_ckpt is None:
-        _base_ckpt = hf_hub_download(repo_id=REPO_ID, filename=CKPT_FILENAME)
+        _base_ckpt = hf_hub_download(repo_id=REPO_ID, filename=CKPT_FILENAME,
+                                     cache_dir=CONFIG.cache_dir,
+                                     local_files_only=CONFIG.offline)
     if _vocoder is None:
         from f5_tts.infer.utils_infer import load_vocoder
         try:
@@ -185,8 +205,8 @@ def get_model(key: str):
             return _model_cache[key]
 
         _ensure_assets()
-        from f5_tts.model import DiT
         from f5_tts.infer.utils_infer import load_model
+        from f5_tts.model import DiT
 
         # Luôn dựng từ checkpoint gốc trước (đúng định dạng EMA) để có mô hình hợp lệ.
         model = load_model(
@@ -201,6 +221,12 @@ def get_model(key: str):
             sd = torch.load(str(ckpt), map_location=DEVICE, weights_only=True)
             cur = {k: v.shape for k, v in model.state_dict().items()}
             compat = {k: v for k, v in sd.items() if k in cur and v.shape == cur[k]}
+            ratio = len(compat) / max(len(cur), 1)
+            if ratio < 0.95:
+                raise ValueError(
+                    f"Checkpoint {ckpt} không tương thích: chỉ khớp "
+                    f"{len(compat)}/{len(cur)} keys ({ratio:.1%})"
+                )
             model.load_state_dict(compat, strict=False)
             print(f"[VVCS] {key}: nạp {len(compat)}/{len(sd)} khoá fine-tune "
                   f"(bỏ {len(sd) - len(compat)} khoá lệch shape)")
@@ -245,13 +271,7 @@ def _transcribe_whisper(audio_path: str) -> str:
 # vào về cùng phân phối giúp phát âm ổn định & rõ hơn.
 
 def _normalize_vi(text: str, add_end_punct: bool = True) -> str:
-    text = (text or "").strip().lower()
-    text = text.replace("…", ".").replace("“", '"').replace("”", '"').replace("’", "'")
-    text = re.sub(r"\s+", " ", text)                 # gộp khoảng trắng/xuống dòng
-    text = re.sub(r"\s+([,.!?;:])", r"\1", text)     # bỏ space trước dấu câu
-    if add_end_punct and text and text[-1] not in ".!?,;:\"')":
-        text += "."                                   # kết câu rõ ràng → đỡ trôi cuối câu
-    return text
+    return normalize_vietnamese(text, lowercase=True, add_end_punct=add_end_punct)
 
 
 # ─── Số liệu khách quan để so sánh chất lượng ───────────────────────────────────
@@ -295,11 +315,7 @@ def _quality_note(wave: np.ndarray, sr: int, lang: str = "vi") -> str:
 
 def _postprocess(wave: np.ndarray) -> np.ndarray:
     """Giới hạn đỉnh để tránh méo do clipping (vocoder thỉnh thoảng vượt 1.0)."""
-    wave = np.nan_to_num(np.asarray(wave, dtype=np.float32))
-    peak = float(np.abs(wave).max()) if wave.size else 0.0
-    if peak > 0.99:
-        wave = wave / peak * 0.99
-    return wave
+    return peak_normalize(wave)
 
 
 # ─── Suy luận ───────────────────────────────────────────────────────────────────
@@ -349,6 +365,13 @@ def _infer_one(model_key, ref_audio_path, ref_text, gen_text, speed, nfe, seed=N
 MAX_SLOTS = 6   # đủ chỗ so sánh CẢ 6 engine cùng lúc
 
 
+def ordered_model_keys(model_keys) -> list[str]:
+    """Deduplicate selected engines while preserving registry/UI order."""
+    registry_order = {key: index for index, key in enumerate(MODEL_REGISTRY)}
+    return sorted({key for key in model_keys if key in MODEL_REGISTRY},
+                  key=lambda key: registry_order[key])[:MAX_SLOTS]
+
+
 def _model_label(key: str, lang: str) -> str:
     entry = MODEL_REGISTRY[key]
     return entry["label"] if lang == "vi" else entry.get("label_en", entry["label"])
@@ -389,8 +412,10 @@ def _status_html(done, total, current_short, lang, total_s=None, extra=""):
                 f'{L["status_done"].format(n=total, s=total_s)}</span>')
         bar = '<div class="bar"><div style="width:100%"></div></div>'
     else:
-        left = (f'<span class="pill pill-gen"><span class="spinner"></span>'
-                f'{L["status_running"].format(i=done + 1, n=total, name=html_mod.escape(current_short))}</span>')
+        status_text = L["status_running"].format(
+            i=done + 1, n=total, name=html_mod.escape(current_short)
+        )
+        left = f'<span class="pill pill-gen"><span class="spinner"></span>{status_text}</span>'
         pct = int(100 * done / max(total, 1))
         bar = f'<div class="bar"><div style="width:{pct}%"></div></div>'
     note = f'<span class="status-note">{html_mod.escape(extra)}</span>' if extra else ""
@@ -398,7 +423,8 @@ def _status_html(done, total, current_short, lang, total_s=None, extra=""):
 
 
 def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
-               lang="vi"):
+               chunk_mode="auto", max_chunk_chars=280, silence_ms=180,
+               voice_rights_confirmed=False, lang="vi"):
     """Generator: sinh audio cho từng mô hình và CẬP NHẬT UI NGAY khi mỗi mô hình
     xong. Engine nhanh chạy trước. Trạng thái hiển thị bằng thẻ HTML riêng cho từng
     card + thanh tiến độ tổng (event dùng show_progress='hidden' nên KHÔNG còn
@@ -410,16 +436,27 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
     # Giữ đúng thứ tự hiển thị trong danh sách chọn mô hình (thứ tự MODEL_REGISTRY),
     # để card kết quả xếp cùng thứ tự với các ô checkbox bên trái — không xáo theo
     # tốc độ engine nữa (người dùng phản hồi thứ tự "nhanh trước" gây khó theo dõi).
-    _registry_order = {k: i for i, k in enumerate(MODEL_REGISTRY)}
-    keys = sorted(set(model_keys), key=lambda k: _registry_order.get(k, 9))[:MAX_SLOTS]
+    keys = ordered_model_keys(model_keys)
     engines_sel = {MODEL_REGISTRY[k].get("engine", "f5tts") for k in keys}
     # Chỉ F5-TTS & XTTS nhân bản giọng nên mới cần audio mẫu.
     if not ref_audio_path and engines_sel & REF_REQUIRED_ENGINES:
         raise gr.Error(L["err_no_ref"])
+    if engines_sel & REF_REQUIRED_ENGINES and not voice_rights_confirmed:
+        raise gr.Error(L["err_rights"])
+    if "edge" in engines_sel and (CONFIG.offline or not CONFIG.enable_cloud_engines):
+        raise gr.Error(L["err_cloud_disabled"])
     if not gen_text or not gen_text.strip():
         raise gr.Error(L["err_no_text"])
     if len(gen_text) > MAX_GEN_CHARS:
         raise gr.Error(L["err_too_long"].format(n=len(gen_text), m=MAX_GEN_CHARS))
+    if chunk_mode == "off" and len(gen_text) > DIRECT_TEXT_LIMIT:
+        raise gr.Error(L["err_chunk_off"].format(n=DIRECT_TEXT_LIMIT))
+    try:
+        max_chunk_chars = int(max_chunk_chars)
+        silence_ms = int(silence_ms)
+        text_chunks = split_long_text(gen_text, max_chunk_chars, chunk_mode)
+    except (TypeError, ValueError) as exc:
+        raise gr.Error(str(exc)) from exc
 
     # Seed: số nguyên cố định để tái lập; < 0 = ngẫu nhiên mỗi lần.
     try:
@@ -428,9 +465,6 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
         seed = DEFAULT_SEED
     if seed < 0:
         seed = random.randint(0, 2**31 - 1)
-
-    # Chuẩn hoá văn bản cần đọc; transcript mẫu chỉ chuẩn hoá nhẹ (không thêm dấu cuối).
-    gen_text_n = _normalize_vi(gen_text, add_end_punct=True)
 
     labels = [_model_label(k, lang) for k in keys]
     shorts = [lb.split("—")[0].strip() for lb in labels]
@@ -481,8 +515,19 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
         try:
             # Cùng seed cho mọi model → so sánh công bằng (cùng nhiễu khởi tạo).
             t0 = time.time()
-            wave, sr = _infer_one(key, ref_audio_path, _ref_text,
-                                  gen_text_n, speed, nfe, seed=seed)
+            chunk_waves = []
+            sr = TARGET_SR
+            for chunk_index, chunk in enumerate(text_chunks):
+                chunk_wave, chunk_sr = _infer_one(
+                    key, ref_audio_path, _ref_text, chunk, speed, nfe,
+                    seed=seed + chunk_index,
+                )
+                if chunk_waves and chunk_sr != sr:
+                    raise RuntimeError("Sample rate thay đổi giữa các chunk")
+                sr = chunk_sr
+                chunk_waves.append(chunk_wave)
+            wave = (chunk_waves[0] if len(chunk_waves) == 1 else
+                    concatenate_audio(chunk_waves, sr, silence_ms))
             gen_s = time.time() - t0
             sf.write(str(OUTPUT_DIR / f"{key}.wav"), wave, sr)
             slot_html[i] = _slot_html(labels[i], "done", lang,
@@ -491,7 +536,14 @@ def synthesize(model_keys, ref_audio_path, ref_text, gen_text, speed, nfe, seed,
             slot_audio[i] = (sr, wave)
         except Exception as e:
             traceback.print_exc()
-            slot_html[i] = _slot_html(labels[i], "error", lang, err=e)
+            try:
+                import engines
+                display_error = engines.friendly_engine_error(key, e)
+            except Exception:
+                display_error = RuntimeError(f"{key} không thể tạo audio: {e}")
+            if "out of memory" in str(e).lower() and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            slot_html[i] = _slot_html(labels[i], "error", lang, err=display_error)
             slot_audio[i] = None
         dirty.add(i)
         if i + 1 < len(keys):
@@ -519,7 +571,8 @@ I18N = {
             "| XTTS-v2 (viXTTS) | Có | Local | Vừa | Cần audio mẫu sạch, không nhạc nền |\n"
             "| MMS-TTS (Meta) | Không (1 giọng) | Local | Rất nhanh | VITS tiếng Việt gọn nhẹ |\n"
             "| Piper (Rhasspy) | Không (1 giọng) | Local | Nhanh nhất | ONNX, kết quả tất định |\n"
-            "| Edge-TTS (Microsoft) | Không (1 giọng) | Cloud | Nhanh | Cần internet; nếu mất mạng sẽ báo lỗi sau tối đa 40 giây |\n"
+            "| Edge-TTS (Microsoft) | Không (1 giọng) | Cloud | Nhanh | "
+            "Cần internet; timeout có kiểm soát |\n"
             "| Bark (Suno) | Không (preset) | Local | Rất chậm | Tiếng Việt hạn chế — chỉ để đối chiếu |\n\n"
             "Lần đầu chọn engine mới, hệ thống sẽ tải mô hình về máy (XTTS khoảng 2GB, "
             "Bark khoảng 1GB, MMS/Piper vài trăm MB) nên lần chạy đầu sẽ lâu hơn bình thường.\n\n"
@@ -540,6 +593,11 @@ I18N = {
         speed="Tốc độ đọc",
         nfe="Độ mịn NFE (chỉ F5-TTS)",
         seed="Seed (-1 = ngẫu nhiên)",
+        chunk_mode="Chia văn bản dài",
+        max_chunk="Độ dài tối đa mỗi đoạn",
+        silence="Khoảng nghỉ giữa đoạn (ms)",
+        rights=("Tôi xác nhận audio mẫu là giọng của tôi, hoặc tôi có quyền và sự đồng ý "
+                "để sử dụng giọng này."),
         btn="Tạo và so sánh giọng nói",
         results_hdr="Kết quả",
         runinfo="Thông tin lần chạy (transcript Whisper, seed)",
@@ -549,6 +607,9 @@ I18N = {
         err_no_ref="Hãy tải lên hoặc thu âm audio mẫu (3–10 giây).",
         err_no_text="Hãy nhập văn bản cần đọc.",
         err_too_long="Văn bản quá dài ({n} ký tự, tối đa {m}). Hãy chia nhỏ.",
+        err_chunk_off="Khi tắt chia đoạn, văn bản tối đa {n} ký tự.",
+        err_rights="Bạn phải xác nhận quyền và sự đồng ý sử dụng giọng trước khi nhân bản.",
+        err_cloud_disabled="Edge-TTS đã bị tắt trong chế độ offline/cloud-disabled.",
         whisper_progress="Whisper đang nhận diện transcript mẫu...",
         whisper_note="[Whisper tự nhận diện] {t}",
         whisper_na="[Whisper không khả dụng — vẫn thử suy luận]",
@@ -578,7 +639,8 @@ I18N = {
             "| XTTS-v2 (viXTTS) | Yes | Local | Medium | Needs a clean sample, no background music |\n"
             "| MMS-TTS (Meta) | No (1 voice) | Local | Very fast | Compact Vietnamese VITS |\n"
             "| Piper (Rhasspy) | No (1 voice) | Local | Fastest | ONNX, deterministic output |\n"
-            "| Edge-TTS (Microsoft) | No (1 voice) | Cloud | Fast | Needs internet; fails clearly after at most 40 seconds |\n"
+            "| Edge-TTS (Microsoft) | No (1 voice) | Cloud | Fast | "
+            "Needs internet; controlled timeout |\n"
             "| Bark (Suno) | No (preset) | Local | Very slow | Limited Vietnamese — reference only |\n\n"
             "The first time you pick a new engine, its model is downloaded (XTTS ~2GB, "
             "Bark ~1GB, MMS/Piper a few hundred MB), so the first run takes longer.\n\n"
@@ -599,6 +661,11 @@ I18N = {
         speed="Speaking speed",
         nfe="NFE quality (F5-TTS only)",
         seed="Seed (-1 = random)",
+        chunk_mode="Long-text chunking",
+        max_chunk="Maximum chunk length",
+        silence="Silence between chunks (ms)",
+        rights=("I confirm that this is my voice, or that I have permission and consent "
+                "to use this voice."),
         btn="Generate and compare",
         results_hdr="Results",
         runinfo="Run info (Whisper transcript, seed)",
@@ -608,6 +675,9 @@ I18N = {
         err_no_ref="Please upload or record a reference sample (3–10 seconds).",
         err_no_text="Please enter the text to speak.",
         err_too_long="Text too long ({n} characters, max {m}). Please split it.",
+        err_chunk_off="With chunking off, text is limited to {n} characters.",
+        err_rights="Confirm voice ownership/consent before running voice cloning.",
+        err_cloud_disabled="Edge-TTS is disabled in offline/cloud-disabled mode.",
         whisper_progress="Whisper is transcribing the reference sample...",
         whisper_note="[Whisper auto-transcript] {t}",
         whisper_na="[Whisper unavailable — proceeding anyway]",
@@ -784,6 +854,16 @@ def create_ui():
                     speed = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label=L0["speed"])
                     nfe = gr.Slider(16, 64, value=DEFAULT_NFE, step=4, label=L0["nfe"])
                 seed = gr.Number(value=DEFAULT_SEED, precision=0, label=L0["seed"])
+                chunk_mode = gr.Radio(
+                    choices=[("Tự động", "auto"), ("Tắt", "off"), ("Tích cực", "aggressive")],
+                    value="auto", label=L0["chunk_mode"],
+                )
+                with gr.Row():
+                    max_chunk_chars = gr.Slider(80, 600, value=CONFIG.max_chunk_chars,
+                                                step=20, label=L0["max_chunk"])
+                    silence_ms = gr.Slider(0, 1000, value=CONFIG.chunk_silence_ms,
+                                           step=20, label=L0["silence"])
+                rights = gr.Checkbox(value=False, label=L0["rights"])
                 btn = gr.Button(L0["btn"], variant="primary", size="lg",
                                 elem_id="generate-btn")
 
@@ -833,6 +913,10 @@ def create_ui():
                 gr.update(label=L["speed"]),
                 gr.update(label=L["nfe"]),
                 gr.update(label=L["seed"]),
+                gr.update(label=L["chunk_mode"]),
+                gr.update(label=L["max_chunk"]),
+                gr.update(label=L["silence"]),
+                gr.update(label=L["rights"]),
                 gr.update(value=L["btn"]),
                 f"### {L['results_hdr']}",
                 gr.update(label=L["runinfo"]),
@@ -844,6 +928,7 @@ def create_ui():
             inputs=[lang, models],
             outputs=[lang_state, hero, tips_acc, tips_md, input_hdr,
                      ref_audio, ref_text, gen_text, models, speed, nfe, seed,
+                     chunk_mode, max_chunk_chars, silence_ms, rights,
                      btn, results_hdr, whisper_display, examples_acc] + slot_audios,
         )
 
@@ -854,7 +939,8 @@ def create_ui():
 
         btn.click(
             fn=synthesize,
-            inputs=[models, ref_audio, ref_text, gen_text, speed, nfe, seed, lang_state],
+            inputs=[models, ref_audio, ref_text, gen_text, speed, nfe, seed,
+                    chunk_mode, max_chunk_chars, silence_ms, rights, lang_state],
             outputs=outputs,
             concurrency_limit=1,          # chạy tuần tự cho ổn định
             # QUAN TRỌNG: tắt overlay loading của Gradio — trước đây nó phủ thanh
@@ -892,7 +978,8 @@ if __name__ == "__main__":
         if DEVICE != "cpu":
             print(f"[VVCS] Nạp model trên '{DEVICE}' lỗi ({e}); chuyển sang CPU.")
             DEVICE = "cpu"
-            _model_cache.clear(); _vocoder = None
+            _model_cache.clear()
+            _vocoder = None
             try:
                 get_model("base")
                 print("[VVCS] Sẵn sàng (CPU)!")

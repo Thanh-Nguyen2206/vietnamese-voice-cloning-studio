@@ -28,17 +28,18 @@ Yêu cầu SRS 2.2:
 =============================================================================
 """
 
-import os
 import argparse
 import csv
+import json
+import sys
+from collections import Counter
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
-import numpy as np
 import librosa
+import numpy as np
 import soundfile as sf
 from tqdm import tqdm
-
 
 # =============================================================================
 # CẤU HÌNH MẶC ĐỊNH
@@ -49,6 +50,51 @@ DEFAULT_MAX_DURATION = 10.0       # giây - segment tối đa (tránh OOM khi tr
 SILENCE_TOP_DB = 30               # ngưỡng dB để phát hiện silence
 SILENCE_PAD_SEC = 0.15            # khoảng nghỉ chèn giữa các đoạn trong remove_silence()
 SUPPORTED_FORMATS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".wma"}
+
+
+def is_invalid_demo_path(path: str | Path) -> bool:
+    """Return whether a path points into the quarantined synthetic demo dataset."""
+    return "_invalid_demo_data" in Path(path).resolve().parts
+
+
+def guard_training_path(path: str | Path, allow_invalid_demo_data: bool = False) -> None:
+    if is_invalid_demo_path(path) and not allow_invalid_demo_data:
+        raise ValueError(
+            "Từ chối data/_invalid_demo_data: đây là dữ liệu sóng sin giả, không được dùng "
+            "để fine-tune. Chỉ dùng --allow-invalid-demo-data-for-technical-tests cho unit/smoke test."
+        )
+
+
+def assess_training_audio(audio: np.ndarray, sr: int) -> tuple[list[str], list[str]]:
+    """Return fatal errors and warnings for a prospective training waveform."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    array = np.asarray(audio)
+    if array.size == 0:
+        return ["audio rỗng"], warnings
+    if not np.isfinite(array).all():
+        return ["audio chứa NaN/Inf"], warnings
+    mono = array.mean(axis=1) if array.ndim == 2 else array.reshape(-1)
+    if array.ndim == 2:
+        warnings.append("audio stereo sẽ được chuyển mono")
+    duration = mono.size / sr
+    rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64))))
+    clipping = float(np.mean(np.abs(mono) >= 0.999))
+    if duration < 0.25:
+        errors.append("audio quá ngắn")
+    if rms < 1e-4:
+        errors.append("audio im lặng hoặc gần im lặng")
+    if clipping > 0.05:
+        errors.append(f"clipping quá cao ({clipping:.1%})")
+    elif clipping > 0.01:
+        warnings.append(f"clipping cao ({clipping:.1%})")
+    if mono.size >= 2048 and rms >= 1e-4:
+        spectrum = np.abs(np.fft.rfft(mono[: min(mono.size, sr * 10)] *
+                                      np.hanning(min(mono.size, sr * 10)))) ** 2
+        concentration = float(spectrum.max() / max(spectrum.sum(), 1e-12))
+        if concentration > 0.45:
+            errors.append("tín hiệu quá đơn giản/giống sóng sin, không phải dữ liệu giọng thật")
+    return errors, warnings
 
 
 def find_audio_files(input_dir: str) -> List[Path]:
@@ -303,6 +349,8 @@ def process_pipeline(args: argparse.Namespace) -> None:
          e. Lưu WAV + ghi metadata
       3. In báo cáo tổng kết
     """
+    guard_training_path(args.input_dir, args.allow_invalid_demo_data_for_technical_tests)
+    guard_training_path(args.output_dir, args.allow_invalid_demo_data_for_technical_tests)
     # --- Khởi tạo thư mục output ---
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -343,6 +391,13 @@ def process_pipeline(args: argparse.Namespace) -> None:
             print(f"   ❌ Lỗi load file: {e}")
             continue
 
+        fatal, quality_warnings = assess_training_audio(audio, args.sample_rate)
+        for warning in quality_warnings:
+            print(f"   ⚠️  {warning}")
+        if fatal:
+            print(f"   ❌ Audio không hợp lệ: {'; '.join(fatal)}")
+            continue
+
         input_dur = len(audio) / args.sample_rate
         total_input_duration += input_dur
         print(f"   ⏱  Thời lượng gốc: {input_dur:.1f}s "
@@ -356,7 +411,7 @@ def process_pipeline(args: argparse.Namespace) -> None:
               f"(đã bỏ {removed_dur:.1f}s silence)")
 
         if len(audio_clean) == 0:
-            print(f"   ⚠️  File toàn silence, bỏ qua.")
+            print("   ⚠️  File toàn silence, bỏ qua.")
             continue
 
         # Bước 2c: Cắt thành segments
@@ -369,8 +424,6 @@ def process_pipeline(args: argparse.Namespace) -> None:
         print(f"   ✂️  Số segments: {len(segments)}")
 
         # Bước 2d+2e: Kiểm tra SNR + Lưu từng segment
-        source_name = audio_path.stem  # Tên file gốc (không có extension)
-
         for seg in segments:
             seg_dur = len(seg) / args.sample_rate
 
@@ -412,7 +465,7 @@ def process_pipeline(args: argparse.Namespace) -> None:
     # BÁO CÁO TỔNG KẾT
     # ==========================================================================
     print(f"\n{'='*60}")
-    print(f"📊 BÁO CÁO TỔNG KẾT")
+    print("📊 BÁO CÁO TỔNG KẾT")
     print(f"{'='*60}")
     print(f"  📂 Input:  {len(audio_files)} files, "
           f"{total_input_duration:.1f}s ({total_input_duration/60:.1f} phút)")
@@ -428,20 +481,20 @@ def process_pipeline(args: argparse.Namespace) -> None:
     if output_minutes < 30:
         print(f"\n  ⚠️  CẢNH BÁO: Tổng thời lượng output ({output_minutes:.1f} phút) "
               f"< 30 phút!")
-        print(f"     Theo SRS 2.2, cần tối thiểu 30 phút audio sạch để fine-tune.")
-        print(f"     Hãy thu thêm dữ liệu hoặc giảm min_duration.")
+        print("     Theo SRS 2.2, cần tối thiểu 30 phút audio sạch để fine-tune.")
+        print("     Hãy thu thêm dữ liệu hoặc giảm min_duration.")
     elif output_minutes > 60:
         print(f"\n  ℹ️  Tổng thời lượng ({output_minutes:.1f} phút) > 60 phút.")
-        print(f"     Dữ liệu đủ dùng. Có thể chọn lọc segments chất lượng cao nhất.")
+        print("     Dữ liệu đủ dùng. Có thể chọn lọc segments chất lượng cao nhất.")
     else:
         print(f"\n  ✅ Tổng thời lượng ({output_minutes:.1f} phút) nằm trong "
               f"khoảng lý tưởng 30-60 phút!")
 
     print(f"\n{'='*60}")
-    print(f"✅ Phase 2 hoàn tất! Tiếp theo:")
+    print("✅ Phase 2 hoàn tất! Tiếp theo:")
     print(f"   1. Kiểm tra audio trong: {output_dir}")
     print(f"   2. Gán transcript vào cột 'text' trong: {metadata_path}")
-    print(f"   3. Chuyển sang Phase 3: Fine-tuning")
+    print("   3. Chuyển sang Phase 3: Fine-tuning")
     print(f"{'='*60}")
 
 
@@ -496,11 +549,102 @@ Ví dụ:
         "--min_snr", type=float, default=20.0,
         help="SNR tối thiểu (dB) để giữ segment (default: 20.0 dB)"
     )
+    parser.add_argument(
+        "--allow-invalid-demo-data-for-technical-tests", action="store_true",
+        help="CHỈ smoke test code path; không được dùng để tuyên bố chất lượng fine-tune",
+    )
 
     return parser.parse_args()
 
 
+def validate_metadata(metadata_path: Path, processed_dir: Path | None = None,
+                      allow_invalid_demo_data: bool = False) -> dict[str, object]:
+    """Validate official pipe-delimited metadata and return a dataset summary."""
+    guard_training_path(metadata_path, allow_invalid_demo_data)
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Metadata không tồn tại: {metadata_path}")
+    base = processed_dir or metadata_path.parent.parent / "processed"
+    guard_training_path(base, allow_invalid_demo_data)
+    rows: list[dict[str, str]] = []
+    with metadata_path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="|")
+        required = {"audio_file", "text"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError("Metadata cần header pipe-delimited có audio_file và text")
+        rows = list(reader)
+    durations: list[float] = []
+    sample_rates: Counter[int] = Counter()
+    transcript_lengths: list[int] = []
+    transcripts: Counter[str] = Counter()
+    missing = invalid = 0
+    for row in rows:
+        audio_ref = (row.get("audio_file") or "").strip()
+        text = (row.get("text") or "").strip()
+        audio_path = Path(audio_ref)
+        if not audio_path.is_absolute():
+            audio_path = base / audio_path
+        if not audio_ref or not text:
+            invalid += 1
+        if not audio_path.is_file():
+            missing += 1
+            continue
+        try:
+            info = sf.info(audio_path)
+            wave, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+            fatal, _ = assess_training_audio(wave, sr)
+            if fatal:
+                invalid += 1
+            durations.append(float(info.duration))
+            sample_rates[int(info.samplerate)] += 1
+        except (RuntimeError, ValueError, OSError):
+            invalid += 1
+        if text:
+            transcript_lengths.append(len(text))
+            transcripts[text.casefold()] += 1
+    duplicates = sum(count - 1 for count in transcripts.values() if count > 1)
+    valid_count = max(len(rows) - invalid - missing, 0)
+    validation_count = max(1, round(valid_count * 0.1)) if valid_count >= 2 else 0
+    return {
+        "file_count": len(rows), "total_duration_sec": sum(durations),
+        "mean_duration_sec": float(np.mean(durations)) if durations else 0.0,
+        "min_duration_sec": min(durations, default=0.0),
+        "max_duration_sec": max(durations, default=0.0),
+        "sample_rate_distribution": dict(sorted(sample_rates.items())),
+        "transcript_length_min": min(transcript_lengths, default=0),
+        "transcript_length_max": max(transcript_lengths, default=0),
+        "duplicate_transcript_count": duplicates, "missing_file_count": missing,
+        "invalid_row_count": invalid, "train_count": valid_count - validation_count,
+        "validation_count": validation_count,
+    }
+
+
+def parse_validate_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate metadata.csv và audio cho fine-tuning")
+    parser.add_argument("--metadata", type=Path, required=True)
+    parser.add_argument("--processed-dir", type=Path)
+    parser.add_argument("--report", type=Path, help="Ghi summary JSON")
+    parser.add_argument("--allow-invalid-demo-data-for-technical-tests", action="store_true")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "validate":
+        validation_args = parse_validate_args(sys.argv[2:])
+        try:
+            summary = validate_metadata(
+                validation_args.metadata, validation_args.processed_dir,
+                validation_args.allow_invalid_demo_data_for_technical_tests,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"❌ Metadata không hợp lệ: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        rendered = json.dumps(summary, ensure_ascii=False, indent=2)
+        print(rendered)
+        if validation_args.report:
+            validation_args.report.parent.mkdir(parents=True, exist_ok=True)
+            validation_args.report.write_text(rendered + "\n", encoding="utf-8")
+        raise SystemExit(1 if summary["invalid_row_count"] or summary["missing_file_count"] else 0)
+
     args = parse_args()
 
     # Validate arguments

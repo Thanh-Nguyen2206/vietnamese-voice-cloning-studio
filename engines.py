@@ -21,6 +21,10 @@ import threading
 
 import numpy as np
 
+from voice_studio.config import load_config
+
+_CONFIG = load_config()
+
 # Khoá RIÊNG cho từng engine: engine này tải/nạp mô hình lần đầu (có thể mất
 # nhiều phút) sẽ KHÔNG chặn engine khác. (Trước đây dùng một khoá chung nên
 # Edge-TTS bị kẹt chờ XTTS/Bark tải mô hình → tưởng như "không hoạt động".)
@@ -29,6 +33,21 @@ _BARK_LOCK  = threading.RLock()
 _MMS_LOCK   = threading.RLock()
 _PIPER_LOCK = threading.RLock()
 TARGET_SR = 24000
+
+
+def friendly_engine_error(engine: str, error: BaseException) -> RuntimeError:
+    """Map dependency, timeout and memory failures to safe end-user messages."""
+    if isinstance(error, ModuleNotFoundError):
+        package = error.name or "optional dependency"
+        return RuntimeError(
+            f"{engine} chưa sẵn sàng vì thiếu '{package}'. Cài dependencies trong requirements.txt."
+        )
+    message = str(error)
+    if "out of memory" in message.lower():
+        return RuntimeError(
+            f"{engine} hết bộ nhớ. Hãy bỏ bớt engine, dùng CPU hoặc khởi động lại app."
+        )
+    return RuntimeError(f"{engine} không thể tạo audio: {message}")
 
 # ─────────────────────────── XTTS-v2 (viXTTS) ────────────────────────────────
 _XTTS_REPO = "capleaf/viXTTS"
@@ -171,7 +190,7 @@ _mms_tok = None
 def _load_mms(device: str):
     global _mms_model, _mms_tok
     if _mms_model is None:
-        from transformers import VitsModel, AutoTokenizer
+        from transformers import AutoTokenizer, VitsModel
         _mms_tok = AutoTokenizer.from_pretrained(_MMS_REPO)
         _mms_model = VitsModel.from_pretrained(_MMS_REPO).to(device)
         _mms_model.eval()
@@ -213,6 +232,7 @@ def piper_infer(ref_audio, ref_text, gen_text, speed, seed, device="cpu"):
     """Piper ONNX — MỘT giọng vi_VN cố định, cực nhanh trên CPU, kết quả tất định."""
     import io
     import wave as wave_mod
+
     import soundfile as sf
     from piper import SynthesisConfig
 
@@ -233,7 +253,7 @@ def piper_infer(ref_audio, ref_text, gen_text, speed, seed, device="cpu"):
 _EDGE_VOICE = "vi-VN-HoaiMyNeural"
 
 
-_EDGE_TIMEOUT_S = 40   # cloud call PHẢI có timeout — không thì mất mạng là treo vô hạn
+_EDGE_TIMEOUT_S = _CONFIG.engine_timeout
 
 
 def edge_infer(ref_audio, ref_text, gen_text, speed, seed, device="cpu"):
@@ -244,8 +264,9 @@ def edge_infer(ref_audio, ref_text, gen_text, speed, seed, device="cpu"):
     """
     import asyncio
     import tempfile
-    import librosa
+
     import edge_tts
+    import librosa
 
     pct = int(round((float(speed) - 1.0) * 100))
     rate = f"{'+' if pct >= 0 else ''}{pct}%"

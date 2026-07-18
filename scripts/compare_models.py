@@ -14,9 +14,9 @@ Cách chạy:
   python scripts/compare_models.py --ref ref.wav --ref-text "..." \
       --models base ft_step_0001000 --nfe 32
 """
+import argparse
 import os
 import sys
-import argparse
 from pathlib import Path
 
 import numpy as np

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "notes": "Đánh giá lại các output audit có sẵn trong repository; text và inference_time lấy từ outputs/comparison/report.md.",
+  "cases": [
+    {"id": "audit-base", "reference_text": "Trí tuệ nhân tạo đang thay đổi cách con người giao tiếp và làm việc mỗi ngày.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/audit_base.wav", "engine": "f5tts", "seed": 42, "nfe": 32, "inference_time": 193.0},
+    {"id": "audit-xtts", "reference_text": "Trí tuệ nhân tạo đang thay đổi cách con người giao tiếp và làm việc mỗi ngày.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/audit_xtts.wav", "engine": "xtts", "seed": 42, "inference_time": 36.2},
+    {"id": "audit-mms", "reference_text": "Trí tuệ nhân tạo đang thay đổi cách con người giao tiếp và làm việc mỗi ngày.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/audit_mms.wav", "engine": "mms", "seed": 42, "inference_time": 3.9},
+    {"id": "audit-piper", "reference_text": "Trí tuệ nhân tạo đang thay đổi cách con người giao tiếp và làm việc mỗi ngày.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/audit_piper.wav", "engine": "piper", "seed": 42, "inference_time": 2.1},
+    {"id": "audit-edge", "reference_text": "Trí tuệ nhân tạo đang thay đổi cách con người giao tiếp và làm việc mỗi ngày.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/audit_edge.wav", "engine": "edge", "seed": 42, "inference_time": 3.0},
+    {"id": "audit-bark", "reference_text": "Trí tuệ nhân tạo đang thay đổi cách con người giao tiếp và làm việc mỗi ngày.", "reference_audio": "../reference_audio/sample_clean_vi.wav", "generated_audio": "../outputs/audit_bark.wav", "engine": "bark", "seed": 42, "inference_time": 167.2}
+  ]
+}

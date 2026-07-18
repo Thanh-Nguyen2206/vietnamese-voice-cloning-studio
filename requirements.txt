@@ -36,20 +36,13 @@ pydub>=0.25.1
 # torchaudio sẽ được cài cùng torch qua setup.sh
 
 # -----------------------------------------------------------------------------
-# 4. Vietnamese Text Processing
-#    - underthesea: Tokenizer + Text Normalization tiếng Việt
-#      (tách từ, chuẩn hóa số, viết tắt, ký tự đặc biệt)
-# -----------------------------------------------------------------------------
-underthesea>=6.8.0
-
-# -----------------------------------------------------------------------------
-# 5. Gradio Web UI
+# 4. Gradio Web UI
 #    Giao diện demo: upload audio, nhập text, tải kết quả
 # -----------------------------------------------------------------------------
 gradio>=4.31.0
 
 # -----------------------------------------------------------------------------
-# 5b. Engine so sánh bổ sung (XTTS-v2 · viXTTS, MMS, Piper, Edge-TTS, Bark)
+# 4b. Engine so sánh bổ sung (XTTS-v2 · viXTTS, MMS, Piper, Edge-TTS, Bark)
 #    - coqui-tts: chạy XTTS-v2 / viXTTS (nhân bản giọng, tiếng Việt)
 #    - num2words: mở rộng số → chữ tiếng Việt cho tokenizer XTTS
 #    - piper-tts: engine ONNX local, giọng vi_VN (nhanh nhất trên CPU)
